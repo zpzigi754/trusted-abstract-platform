@@ -1291,7 +1291,7 @@ procedure [inline] cpu_store_va(vaddr : vaddr_t, data : word_t, repl_way : cache
 //
 // Common Procedures found in ImplCommon.bpl
 //
-procedure tap_addr_valid_proofs()
+procedure [inline] tap_addr_valid_proofs()
 {
     // setting the present bit does not affect the axrw bits.
     assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_p(p)));

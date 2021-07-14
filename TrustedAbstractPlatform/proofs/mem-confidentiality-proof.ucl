@@ -119,8 +119,59 @@ procedure ProveConfidentialityMem(
     observation_1 = k0_word_t;
     observation_2 = k0_word_t;
 
+    //assert(false);
+
     assert (current_mode == mode_untrusted);
     current_mode = mode_untrusted;
+
+    if (!enclave_dead) {
+        havoc r_proof_op;   havoc r_eid;    havoc r_pc;   havoc r_read;   havoc r_write;
+        havoc r_data;       havoc l_vaddr;  havoc s_vaddr;  havoc s_data;   havoc r_pt_eid;
+        havoc r_pt_va;      havoc pt_eid;   havoc pt_vaddr; havoc pt_valid; havoc  pt_paddr;
+        havoc  r_addr_valid; havoc r_addr_map; havoc r_excl_vaddr; havoc r_excl_map;
+        havoc r_bmap;     havoc r_container_valid; havoc r_container_data; havoc r_entrypoint;
+        havoc r_l_way;    havoc  r_s_way;
+
+        assume valid_regindex(r_read);
+        assume valid_regindex(r_write);
+        assume valid_cache_way_index(r_l_way);
+        assume valid_cache_way_index(r_s_way);
+
+        // trace_1
+        call (observation_1, current_mode_1, enclave_dead_1, status_1, excp_1_1, excp_1_2, hit_1_1, hit_1_2) =
+                                cpu_1.ObserverStep(k_mem_observer_t, current_mode, eid, r_eid, r_proof_op, 
+                                            r_pc, r_read, r_write, r_data, 
+                                            l_vaddr, s_vaddr, s_data,
+                                            r_pt_eid, r_pt_va,
+                                            pt_eid, pt_vaddr, pt_valid, pt_paddr,
+                                            r_addr_valid, r_addr_map, r_excl_vaddr,
+                                            r_excl_map, r_container_valid, r_container_data,
+                                            r_entrypoint, r_bmap,
+                                            r_l_way, r_s_way);
+
+        // trace_2
+        call (observation_2, current_mode_2, enclave_dead_2, status_2, excp_2_1, excp_2_2, hit_2_1, hit_2_2) =
+                                cpu_2.ObserverStep(k_mem_observer_t, current_mode, eid, r_eid, r_proof_op, 
+                                            r_pc, r_read, r_write, r_data, 
+                                            l_vaddr, s_vaddr, s_data,
+                                            r_pt_eid, r_pt_va,
+                                            pt_eid, pt_vaddr, pt_valid, pt_paddr,
+                                            r_addr_valid, r_addr_map, r_excl_vaddr,
+                                            r_excl_map, r_container_valid, r_container_data,
+                                            r_entrypoint, r_bmap,
+                                            r_l_way, r_s_way);
+
+        // some sanity checks.
+        assert status_1 == status_2;
+        assert current_mode_1 == current_mode_2;
+        assert enclave_dead_1 == enclave_dead_2;
+        current_mode = current_mode_1;
+        enclave_dead = enclave_dead_2;
+
+        //assert(false);
+    }
+
+    //assert(false);
     
     
     
@@ -295,6 +346,7 @@ procedure ProveConfidentialityMem(
             assert enclave_dead_1 == enclave_dead_2;
             current_mode = current_mode_1;
             enclave_dead = enclave_dead_2;
+            //assert(false);
         } else {
             //assert(false);
             havoc e_proof_op;
@@ -321,7 +373,9 @@ procedure ProveConfidentialityMem(
             assume (!e_excl_vaddr_1[store_addr_1] || !e_excl_vaddr_2[store_addr_2]) ==>
                        (store_addr_1 == store_addr_2 && store_data_1 == store_data_2 &&
                         cpu_1.cpu.cpu_addr_map[store_addr_1] == cpu_2.cpu.cpu_addr_map[store_addr_2]);
+            //assert(false);
         }
+        //assert(false);
     }
 }
 
@@ -331,7 +385,7 @@ control {
   set_solver_option(":relevancy", 0);
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
-  //set_solver_option(":timeout", 8000);
+  set_solver_option(":timeout", 60000);
 
   verif_prove_conf_mem = verify(ProveConfidentialityMem);
   

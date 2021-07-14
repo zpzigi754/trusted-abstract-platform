@@ -192,6 +192,7 @@ procedure [noinline] measurement_proof_part1()
   assume measurement_1p == measurement_2p;
   assert current_mode_1 == current_mode_2;
   current_mode = current_mode_1;
+  //assert(false);
 }
 
 procedure measurement_proof_part2
@@ -311,7 +312,6 @@ procedure measurement_proof_part2
   havoc done;
 
   // first unrolling
-  // TODO: add assertions for completeness
   if (!done) {
     havoc proof_op;
     havoc regs;
@@ -324,6 +324,7 @@ procedure measurement_proof_part2
     assert current_mode_1 == current_mode_2;
     current_mode = current_mode_1;
     havoc done; 
+    //assert(false);
   }
 
   while (!done)
@@ -448,6 +449,7 @@ procedure measurement_proof_part2
       call (status_2, current_mode_2) = cpu_2.MeasurementUntrustedOp(proof_op, eid_2, regs);
       assert(current_mode_1 == current_mode_2);
       current_mode = current_mode_1;
+      //assert(false);
     } else {
       havoc iter;
 
@@ -463,7 +465,9 @@ procedure measurement_proof_part2
       assert word_1 == word_2;
       assert current_mode_1 == current_mode_2;
       current_mode = current_mode_1;
+      //assert(false);
     }
+    //assert(false);
   }
 }
 
@@ -494,6 +498,7 @@ procedure measurement_proof()
          e_excl_vaddr_1, e_excl_vaddr_2,
          e_excl_map_1, e_excl_map_2,
          e_entrypoint_1, e_entrypoint_2);
+  //assert(false);
 }
 
 

@@ -60,6 +60,27 @@ procedure ProveIntegrity()
     // main loop.
     enclave_dead = false;
 
+    //assert(false);
+
+    havoc r_eid; havoc r_proof_op; havoc e_proof_op; havoc r_regs;
+    assume tap_proof_op_valid(r_proof_op);
+
+    // execute the operation in trace_1
+    call (current_mode, enclave_dead) = cpu_1.IntegrityAdversarialStep(
+            current_mode, eid, r_eid, r_regs, r_proof_op);
+
+    // if the mode changed, we need to do this in trace_2
+    if (current_mode == mode_enclave) {
+        call (current_mode, enclave_dead) = cpu_2.IntegrityAdversarialStep(
+                current_mode, eid, r_eid, r_regs, r_proof_op);
+        // sanity check.
+        assert current_mode == mode_enclave;
+        assert !enclave_dead;
+        //assert(false);
+    }
+
+    //assert(false);
+
     while (!enclave_dead)
         //----------------------------------------------------------------------//
         // global TAP invariants.                                               //
@@ -185,7 +206,9 @@ procedure ProveIntegrity()
                 // sanity check.
                 assert current_mode == mode_enclave;
                 assert !enclave_dead;
+                //assert(false);
             }
+            //assert(false);
         } else {
             if (current_mode == mode_enclave) {
                 havoc iter;
@@ -202,9 +225,12 @@ procedure ProveIntegrity()
                 current_mode = current_mode_1;
                 assert vaddr_1 == vaddr_2;
                 assert data_1 == data_2;
+                //assert(false);
             }
+            //assert(false);
           
         }
+        //assert(false);
     }
 }
 
@@ -217,7 +243,7 @@ control {
   set_solver_option(":relevancy", 0);
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
-  //set_solver_option(":timeout", 8000);
+  set_solver_option(":timeout", 240000);
   verif_prove_integrity = verify(ProveIntegrity);
   check;
   print_results;

@@ -241,6 +241,8 @@ procedure [noinline] measure_state_self_composed(
   }
   t1 = update_digest_virt_addr(av1, am1, ev1, m1, va, t1);
   t2 = update_digest_virt_addr(av2, am2, ev2, m2, va, t2);
+
+  //assert (false);
 }
 
 
