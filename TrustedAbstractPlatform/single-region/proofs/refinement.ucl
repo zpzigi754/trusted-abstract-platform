@@ -1,0 +1,460 @@
+module single_region_refinement {
+
+type * = single_region_tap.*;
+const * = single_region_tap.*;
+function * = single_region_tap.*;
+define * = single_region_tap.*;
+
+instance standard_tap : tap();
+
+instance sing_reg_tap : single_region_tap();
+
+
+procedure [inline] refinement_proof_step_load() 
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var vaddr: vaddr_t;
+    var l_way: cache_way_index_t;
+    var std_data: word_t;
+    var sing_data : word_t;
+    var std_exn: exception_t;
+    var sing_exn : exception_t;
+    var std_hit: boolean;
+    var sing_hit : boolean;
+
+    havoc vaddr;
+    havoc l_way;
+
+    assume valid_cache_way_index(l_way);
+
+    call (sing_data, sing_exn, sing_hit) = sing_reg_tap.cpu_load_va(vaddr, l_way);
+
+    if (sing_exn == excp_none) {
+        call (std_data, std_exn, std_hit) = standard_tap.cpu_load_va(vaddr, l_way);
+        assert sing_data == std_data;
+        assert std_exn == excp_none;
+        // assert sing_hit == std_hit; // Since caches are initialized non-deterministically, we don't assert this.
+    }
+}
+
+
+procedure [inline] refinement_proof_fetch()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var vaddr: vaddr_t;
+    var f_way: cache_way_index_t;
+    var std_data: word_t;
+    var sing_data : word_t;
+    var std_exn: exception_t;
+    var sing_exn : exception_t;
+    var std_hit: boolean;
+    var sing_hit : boolean;
+
+    havoc vaddr;
+    havoc f_way;
+
+    assume valid_cache_way_index(f_way);
+
+    assert (sing_reg_tap.cpu.cpu_cache_enabled == standard_tap.cpu.cpu_cache_enabled);
+
+    call (sing_data, sing_exn, sing_hit) = sing_reg_tap.cpu_fetch_va(vaddr, f_way);
+
+    if (sing_exn == excp_none) {
+        call (std_data, std_exn, std_hit) = standard_tap.cpu_fetch_va(vaddr, f_way);
+        assert sing_data == std_data;
+        assert std_exn == excp_none;
+        // assert sing_hit == std_hit; // Since caches are initialized non-deterministically, we don't assert this.
+    }
+
+}
+
+
+procedure [inline] refinement_proof_store() 
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var vaddr: vaddr_t;
+    var data: word_t;
+    var s_way: cache_way_index_t;
+
+    var std_exn: exception_t;
+    var sing_exn : exception_t;
+    var std_hit: boolean;
+    var sing_hit : boolean;
+
+    havoc vaddr;
+    havoc data;
+    havoc s_way;
+
+    assume valid_cache_way_index(s_way);
+
+    call (sing_exn, sing_hit) = sing_reg_tap.cpu_store_va(vaddr, data, s_way);
+
+    if (sing_exn == excp_none) {
+        call (std_exn, std_hit) = standard_tap.cpu_store_va(vaddr, data, s_way);
+        assert std_exn == excp_none;
+        // assert sing_hit == std_hit; // Since caches are initialized non-deterministically, we don't assert this.
+    }
+}
+
+
+procedure [inline] refinement_proof_launch()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var eid               : tap_enclave_id_t;
+    var addr_valid        : addr_valid_t;
+    var addr_map          : addr_map_t;
+    var excl_vaddr        : excl_vaddr_t;
+    var excl_paddr        : excl_map_t;
+    var bounds            : bounds_t;
+    var entrypoint        : vaddr_t;
+
+    var std_exn, sing_exn : enclave_op_result_t;
+
+    havoc eid;
+    havoc addr_valid;
+    havoc addr_map;
+    havoc excl_vaddr;
+    havoc excl_paddr;
+    havoc bounds;
+    havoc entrypoint;
+
+    call (sing_exn) = sing_reg_tap.launch(eid, addr_valid, addr_map, excl_vaddr, excl_paddr, bounds, entrypoint);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.launch(eid, addr_valid, addr_map, excl_vaddr, excl_paddr, entrypoint);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_enter()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var eid : tap_enclave_id_t;
+
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    havoc eid;
+
+    call (sing_exn) = sing_reg_tap.enter(eid);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.enter(eid);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_resume()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var eid : tap_enclave_id_t;
+
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    havoc eid;
+
+    call (sing_exn) = sing_reg_tap.resume(eid);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.resume(eid);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_exit()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    call (sing_exn) = sing_reg_tap.exit();
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.exit();
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_pause()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    call (sing_exn) = sing_reg_tap.pause();
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.pause();
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_destroy()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var eid : tap_enclave_id_t;
+
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    havoc eid;
+
+    call (sing_exn) = sing_reg_tap.destroy(eid);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.destroy(eid);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_release_blocked_memory()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var bmap: excl_map_t;
+    var bounds: bounds_t;
+
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    havoc bmap;
+    havoc bounds;
+
+    call (sing_exn) = sing_reg_tap.release_blocked_memory(bmap, bounds);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.release_blocked_memory(bmap);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+procedure [inline] refinement_proof_block_memory() 
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var bmap: excl_map_t;
+    var bounds: bounds_t;
+
+    var std_exn, sing_exn: enclave_op_result_t;
+
+    havoc bmap;
+    havoc bounds;
+
+    call (sing_exn) = sing_reg_tap.block_memory_region(bmap, bounds);
+
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.block_memory_region(bmap);
+        assert (std_exn == enclave_op_success);
+    }
+
+}
+
+
+procedure [inline] refinement_proof_set_addr_map() 
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var va: vaddr_t;
+    var pa: wap_addr_t;
+    var valid: addr_perm_t;
+
+    havoc va;
+    havoc pa;
+    havoc valid;
+
+    call sing_reg_tap.set_addr_map(va, pa, valid);
+    call standard_tap.set_addr_map(va, pa, valid);
+}
+
+procedure [inline] refinement_proof_set_enclave_addr_map()
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    var eid: tap_enclave_id_t;
+    var va: vaddr_t;
+    var pa: wap_addr_t;
+    var valid: addr_perm_t;
+
+    var sing_exn, std_exn : enclave_op_result_t;
+
+    havoc eid;
+    havoc va;
+    havoc pa;
+    havoc valid;
+
+    call (sing_exn) = sing_reg_tap.set_enclave_addr_map(eid, va, valid, pa);
+    if (sing_exn == enclave_op_success) {
+        call (std_exn) = standard_tap.set_enclave_addr_map(eid, va, valid, pa);
+        assert (std_exn == enclave_op_success);
+    }
+}
+
+
+
+
+procedure ProveStandardSingleRegionTAPRefinement() 
+    modifies standard_tap;
+    modifies sing_reg_tap;
+{
+    // First initialize the two platforms
+    assume sing_reg_tap.block_os_ev_read == standard_tap.block_os_ev_read;
+    assume sing_reg_tap.cpu.cpu_cache_enabled == standard_tap.cpu.cpu_cache_enabled;
+
+    call sing_reg_tap.initialize_tap();
+    call standard_tap.initialize_tap();
+
+    // We make the following assumptions since there is a bunch of state that is non-deterministically
+    // initiated upon platform initialization.
+    // TODO: Check these
+    assume sing_reg_tap.untrusted_addr_map == standard_tap.untrusted_addr_map;
+    assume sing_reg_tap.untrusted_addr_valid == standard_tap.untrusted_addr_valid;
+    assume sing_reg_tap.untrusted_addr_map == standard_tap.untrusted_addr_map;
+    assume sing_reg_tap.untrusted_pc == standard_tap.untrusted_pc;
+    assume sing_reg_tap.untrusted_regs == standard_tap.untrusted_regs;
+    
+    assume sing_reg_tap.tap_enclave_metadata_addr_map == standard_tap.tap_enclave_metadata_addr_map;
+    assume sing_reg_tap.tap_enclave_metadata_addr_valid == standard_tap.tap_enclave_metadata_addr_valid;
+    assume sing_reg_tap.tap_enclave_metadata_addr_excl == standard_tap.tap_enclave_metadata_addr_excl;
+    assume sing_reg_tap.tap_enclave_metadata_num_threads == standard_tap.tap_enclave_metadata_num_threads;
+    assume sing_reg_tap.tap_enclave_metadata_entrypoint == standard_tap.tap_enclave_metadata_entrypoint;
+    assume sing_reg_tap.tap_enclave_metadata_pc == standard_tap.tap_enclave_metadata_pc;
+    assume sing_reg_tap.tap_enclave_metadata_regs == standard_tap.tap_enclave_metadata_regs;
+    assume sing_reg_tap.tap_enclave_metadata_paused == standard_tap.tap_enclave_metadata_paused;
+    assume sing_reg_tap.tap_enclave_metadata_cache_conflict == standard_tap.tap_enclave_metadata_cache_conflict;
+
+
+
+    // Now run the two enclave platforms in lock step.
+    while (true)
+        // The refinement relation is expressed as loop invariants
+        // In this case there is practically a one-to-one correspondence between the two TAP models so we just want to make sure that the states are equal.
+
+        // Equate cache state
+        invariant sing_reg_tap.cpu.cpu_cache_enabled ==>
+                    (forall (i : cache_set_index_t, w : cache_way_index_t) :: 
+                        (valid_cache_set_index(i) && valid_cache_way_index(w)) ==> 
+                            (sing_reg_tap.cpu.cache.cache_valid_map[i, w] == standard_tap.cpu.cache.cache_valid_map[i, w]));
+        invariant sing_reg_tap.cpu.cpu_cache_enabled ==> 
+                    (forall (i : cache_set_index_t, w : cache_way_index_t) :: 
+                        (valid_cache_set_index(i) && valid_cache_way_index(w) && sing_reg_tap.cpu.cache.cache_valid_map[i, w]) ==> 
+                            sing_reg_tap.cpu.cache.cache_tag_map[i, w] == standard_tap.cpu.cache.cache_tag_map[i, w]);
+
+
+        // Equate CPU state
+        invariant sing_reg_tap.cpu.cpu_cache_enabled == standard_tap.cpu.cpu_cache_enabled;
+        invariant sing_reg_tap.cpu.cpu_enclave_id == standard_tap.cpu.cpu_enclave_id;
+        invariant sing_reg_tap.cpu.cpu_pc == standard_tap.cpu.cpu_pc;
+        invariant sing_reg_tap.cpu.cpu_mem == standard_tap.cpu.cpu_mem;
+        invariant sing_reg_tap.cpu.cpu_regs == standard_tap.cpu.cpu_regs;
+        invariant sing_reg_tap.cpu.cpu_addr_valid == standard_tap.cpu.cpu_addr_valid;
+        invariant sing_reg_tap.cpu.cpu_addr_map == standard_tap.cpu.cpu_addr_map;
+        invariant sing_reg_tap.cpu.cpu_owner_map == standard_tap.cpu.cpu_owner_map;
+
+        // Equate TAP state
+        invariant sing_reg_tap.untrusted_addr_valid == standard_tap.untrusted_addr_valid;
+        invariant sing_reg_tap.untrusted_addr_map == standard_tap.untrusted_addr_map;
+        invariant sing_reg_tap.untrusted_regs == standard_tap.untrusted_regs;
+        invariant sing_reg_tap.untrusted_pc == standard_tap.untrusted_pc;
+
+
+        invariant sing_reg_tap.tap_enclave_metadata_valid == standard_tap.tap_enclave_metadata_valid;
+        invariant sing_reg_tap.tap_enclave_metadata_addr_map == standard_tap.tap_enclave_metadata_addr_map;
+        invariant sing_reg_tap.tap_enclave_metadata_addr_valid == standard_tap.tap_enclave_metadata_addr_valid;
+        invariant sing_reg_tap.tap_enclave_metadata_addr_excl == standard_tap.tap_enclave_metadata_addr_excl;
+        invariant sing_reg_tap.tap_enclave_metadata_num_threads == standard_tap.tap_enclave_metadata_num_threads;
+        invariant sing_reg_tap.tap_enclave_metadata_entrypoint == standard_tap.tap_enclave_metadata_entrypoint;
+        invariant sing_reg_tap.tap_enclave_metadata_pc == standard_tap.tap_enclave_metadata_pc;
+        invariant sing_reg_tap.tap_enclave_metadata_regs == standard_tap.tap_enclave_metadata_regs;
+        invariant sing_reg_tap.tap_enclave_metadata_paused == standard_tap.tap_enclave_metadata_paused;
+        invariant sing_reg_tap.tap_enclave_metadata_cache_conflict == standard_tap.tap_enclave_metadata_cache_conflict;
+
+
+
+
+
+
+
+
+
+    {
+        if (*) {
+            call refinement_proof_step_load();
+        } else {
+            if (*) {
+                call refinement_proof_fetch();
+            } else {
+                if (*) {
+                    call refinement_proof_store();
+                } else {
+                    if (*) {
+                        call refinement_proof_launch();
+                    } else {
+                        if (*) {
+                            call refinement_proof_enter();
+                        } else {
+                            if (*) {
+                                call refinement_proof_resume();
+                            } else {
+                                if (*) {
+                                    call refinement_proof_exit();
+                                } else {
+                                    if (*) {
+                                        call refinement_proof_pause();
+                                    } else {
+                                        if (*) {
+                                            call refinement_proof_destroy();
+                                        } else {
+                                            if (*) {
+                                                call refinement_proof_release_blocked_memory();
+                                            } else {
+                                                if (*) {
+                                                    call refinement_proof_block_memory();
+                                                } else {
+                                                    if (*) {
+                                                        call refinement_proof_set_addr_map();
+                                                    } else {
+                                                        call refinement_proof_set_enclave_addr_map();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //assert(false);
+    }
+}
+
+
+// We only invoke functions that change TAP state. 
+next {
+    }
+
+
+control {
+    set_solver_option(":mbqi", false);
+    set_solver_option(":case_split", 0);
+    set_solver_option(":relevancy", 0);
+    set_solver_option(":threads", 4);
+    set_solver_option(":blast_full", true);
+    set_solver_option(":timeout", 30000);
+
+    refinement_verif = verify(ProveStandardSingleRegionTAPRefinement);
+
+    check;
+    print_results;
+}
+
+}
+
+
+

@@ -412,7 +412,7 @@ control {
   set_solver_option(":relevancy", 0);
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
-  set_solver_option(":timeout", 60000);
+  set_solver_option(":timeout", 120000);
   verif_prove_conf_pt = verify(ProveConfidentialityPT);
 
   check;

@@ -1,0 +1,4170 @@
+module faas_tap { 
+
+type * = ap_types.*;
+const * = ap_types.*;
+function * = ap_types.*;
+define * = ap_types.*;
+
+//
+// TAP uarch state
+//
+const block_os_ev_read  : boolean;
+
+
+
+
+//
+// State of the untrusted code (OS and its minion).
+//
+//the untrusted pages
+var untrusted_addr_valid : addr_valid_t;
+var untrusted_addr_map   : addr_map_t;
+var untrusted_regs       : regs_t;
+var untrusted_pc         : vaddr_t;
+
+
+//
+// The enclaves in the system
+//
+var tap_enclave_metadata_valid          : tap_enclave_metadata_valid_t;
+var tap_enclave_metadata_addr_map       : tap_enclave_metadata_addr_map_t;
+var tap_enclave_metadata_addr_valid     : tap_enclave_metadata_addr_valid_t;
+var tap_enclave_metadata_addr_excl      : tap_enclave_metadata_addr_excl_t;
+var tap_enclave_metadata_num_threads    : tap_enclave_metadata_num_threads_t;
+var tap_enclave_metadata_entrypoint     : tap_enclave_metadata_entrypoint_t;
+var tap_enclave_metadata_pc             : tap_enclave_metadata_pc_t;
+var tap_enclave_metadata_regs           : tap_enclave_metadata_regs_t;
+var tap_enclave_metadata_paused         : tap_enclave_metadata_paused_t;
+var tap_enclave_metadata_cache_conflict : tap_enclave_metadata_cache_conflict_t;
+
+
+// New state for FAAS enclaves
+// TODO: Make sure that this state is managed by all other procedures
+var tap_enclave_metadata_is_snapshot      : tap_enclave_metadata_is_snapshot_t;
+var tap_enclave_metadata_child_count      : tap_enclave_metadata_child_count_t;
+var tap_enclave_metadata_parent           : tap_enclave_metadata_parent_t;
+var tap_enclave_metadata_wap_addr_free    : tap_enclave_metadata_wap_addr_free_t;
+
+// for post-init measurement
+//TODO: Need to guarantee the uniqueness of a null measurement
+var tap_enclave_metadata_postinit_measurement : tap_enclave_metadata_measurement_t;
+
+// Extra stuff for tracking bounds
+var tap_enclave_metadata_region_bounds  : tap_enclave_metadata_region_bounds_t;
+var tap_enclave_metadata_bounds_valid   : tap_enclave_metadata_bounds_valid_t;
+
+
+
+instance cpu : cow_cpu(
+    tap_enclave_metadata_parent        : (tap_enclave_metadata_parent),
+    tap_enclave_metadata_wap_addr_free : (tap_enclave_metadata_wap_addr_free)
+);
+
+//TODO: rx permissions for children
+
+//
+// Helper Procedures
+//
+procedure [noinline] do_mappings_alias_v(
+  addr_valid : excl_vaddr_t,
+  addr_map   : addr_map_t
+)
+  returns (alias : boolean)
+  ensures (exists (v1, v2 : vaddr_t) :: vaddr_alias(addr_valid, addr_map, v1, v2))
+          <==> alias;
+  ensures (forall (v1, v2 : vaddr_t) :: !vaddr_alias(addr_valid, addr_map, v1, v2))
+          <==> (!alias);
+{
+  
+}
+
+
+procedure does_paddr_conflict(eid : tap_enclave_id_t, pa1 : wap_addr_t)
+  returns (conflict : boolean)
+  requires cpu.cpu_owner_map[pa1] == eid;
+  ensures (exists (p : wap_addr_t) ::
+                cpu.cpu_owner_map[p] != eid && paddr2set(pa1) == paddr2set(p))
+          <==> conflict;
+{
+  var pa : wap_addr_t;
+
+  pa = k0_wap_addr_t;
+  conflict = false;
+  while (LT_wapa(pa, kmax_wap_addr_t))
+    invariant (exists (p : wap_addr_t) ::
+                LT_wapa(p, pa) && cpu.cpu_owner_map[p] != eid && paddr2set(pa1) == paddr2set(p))
+              <==> conflict;
+  {
+    if (cpu.cpu_owner_map[pa] != eid && paddr2set(pa1) == paddr2set(pa)) {
+      conflict = true;
+    }
+    pa = PLUS_wapa(pa, k1_wap_addr_t);
+  }
+  if (cpu.cpu_owner_map[pa] != eid && paddr2set(pa1) == paddr2set(pa)) {
+    conflict = true;
+  }
+}
+
+procedure does_enclave_conflict(eid : tap_enclave_id_t)
+  returns (conflict : boolean)
+  ensures (exists (p1, p2 : wap_addr_t) ::
+                cpu.cpu_owner_map[p1] == eid  &&
+                cpu.cpu_owner_map[p2] != eid  &&
+                paddr2set(p1) == paddr2set(p2))
+            <==> conflict;
+{
+  var pa : wap_addr_t;
+  var pa_conflict : boolean;
+
+  pa = k0_wap_addr_t;
+  conflict = false;
+  while (LT_wapa(pa, kmax_wap_addr_t))
+    invariant (exists (p1, p2 : wap_addr_t) ::
+                  LT_wapa(p1, pa)           &&
+                  cpu.cpu_owner_map[p1] == eid  &&
+                  cpu.cpu_owner_map[p2] != eid  &&
+                  paddr2set(p1) == paddr2set(p2))
+              <==> conflict;
+  {
+    if (cpu.cpu_owner_map[pa] == eid) {
+      call (pa_conflict) = does_paddr_conflict(eid, pa);
+      conflict = conflict || pa_conflict;
+    }
+    pa = PLUS_wapa(pa, k1_wap_addr_t);
+  }
+  if (cpu.cpu_owner_map[pa] == eid) {
+    call (pa_conflict) = does_paddr_conflict(eid, pa);
+    conflict = conflict || pa_conflict;
+  }
+}
+
+
+
+
+//
+// CPU Procedures
+//
+procedure [noinline] initialize_tap()
+  ensures cpu.cpu_enclave_id == tap_null_enc_id;
+  ensures cpu.cpu_addr_map == untrusted_addr_map;
+  ensures cpu.cpu_addr_valid == untrusted_addr_valid;
+  ensures cpu.cpu_pc == untrusted_pc;
+  ensures cpu.cpu_regs == untrusted_regs;
+  ensures (forall (p : wap_addr_t) :: cpu.cpu_mem[p] == k0_word_t);
+  ensures (forall (p : wap_addr_t) :: cpu.cpu_owner_map[p] == tap_null_enc_id);
+  ensures (forall (e : tap_enclave_id_t) :: !tap_enclave_metadata_valid[e]);
+  ensures (tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]));
+  ensures cpu.cpu_cache_enabled ==>
+            (forall (i : cache_set_index_t, w : cache_way_index_t) ::
+              (valid_cache_set_index(i) && valid_cache_way_index(w)) ==> !cpu.cache.cache_valid_map[i, w]);
+  ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) :: 
+            (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==>
+              (cpu.cpu_owner_map[pa] != e));
+  ensures (forall (e : tap_enclave_id_t) ::
+            tap_enclave_metadata_valid[e] ==>
+              tap_addr_perm_x((tap_enclave_metadata_addr_valid[e])[tap_enclave_metadata_entrypoint[e]]));
+  ensures tap_enclave_metadata_parent[tap_null_enc_id] == tap_invalid_enc_id;
+  ensures (forall (eid : tap_enclave_id_t, pa: wap_addr_t) :: tap_enclave_metadata_wap_addr_free[eid][pa] <==> cpu.cpu_owner_map[pa] == eid);
+  ensures (forall (pa : wap_addr_t) :: tap_enclave_metadata_wap_addr_free[tap_null_enc_id][pa] == true); 
+  ensures (forall (e : tap_enclave_id_t, pa : wap_addr_t) :: (e != tap_null_enc_id) ==> 
+                tap_enclave_metadata_wap_addr_free[e][pa] == false);
+
+  ensures (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_bounds_valid[e] == false);
+  ensures (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_is_snapshot[e] == false);
+  ensures (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] == 0);
+  ensures (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_parent[e] == tap_invalid_enc_id);
+  ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+  ensures (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+  ensures (forall (p_e : tap_enclave_id_t, e : tap_enclave_id_t) :: 
+        (p_e != tap_invalid_enc_id && !tap_enclave_metadata_valid[p_e] ==> tap_enclave_metadata_parent[e] != p_e));
+
+
+
+
+
+  modifies untrusted_addr_map,
+           untrusted_addr_valid,
+           untrusted_pc,
+           untrusted_regs,
+           tap_enclave_metadata_valid,
+           tap_enclave_metadata_parent;
+  modifies tap_enclave_metadata_wap_addr_free;
+  modifies tap_enclave_metadata_bounds_valid;
+  modifies tap_enclave_metadata_is_snapshot;
+  modifies tap_enclave_metadata_child_count;
+  modifies cpu;
+{
+  // Initialize CPU
+  havoc untrusted_addr_map;
+  havoc untrusted_addr_valid;
+  havoc untrusted_addr_map; 
+  havoc untrusted_pc;
+  havoc untrusted_regs;
+
+  call cpu.set_cpu_state(tap_null_enc_id,
+                         untrusted_addr_map,
+                         untrusted_addr_valid,
+                         untrusted_pc,
+                         untrusted_regs);
+  
+
+
+  // memory is all zero'd out
+  call cpu.havoc_cpu_mem();
+  assume (forall (p : wap_addr_t) :: cpu.cpu_mem[p] == k0_word_t);
+  
+  
+  // no enclaves exists
+  call cpu.havoc_cpu_owner_map();
+  assume (forall (pa : wap_addr_t) :: cpu.cpu_owner_map[pa] == tap_null_enc_id);
+  // and that the PC is in the same state
+  assume (tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]));
+  assume (cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id);
+  
+  if (cpu.cpu_cache_enabled) {
+    call cpu.initialize_cache();
+  }
+
+  // Initialize SM 
+  havoc tap_enclave_metadata_valid;
+  havoc tap_enclave_metadata_parent;
+  havoc tap_enclave_metadata_wap_addr_free;
+  havoc tap_enclave_metadata_bounds_valid;
+  havoc tap_enclave_metadata_is_snapshot;
+
+  assume (forall (e : tap_enclave_id_t) :: !tap_enclave_metadata_valid[e]);
+  assume (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_parent[e] == tap_invalid_enc_id);
+
+  //TODO: On initialization all physical addresses are free and owned by the host. 
+  assume (forall (pa : wap_addr_t) :: tap_enclave_metadata_wap_addr_free[tap_null_enc_id][pa] == true); 
+  assume (forall (e : tap_enclave_id_t, pa : wap_addr_t) :: (e != tap_null_enc_id) ==> 
+                tap_enclave_metadata_wap_addr_free[e][pa] == false);
+
+  assume (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_bounds_valid[e] == false);
+  assume (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_is_snapshot[e] == false);
+  assume (forall (e : tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] == 0);
+}
+
+
+procedure [inline] set_addr_map(va : vaddr_t, pa : wap_addr_t, valid : addr_perm_t)
+  //ensures (cpu.cpu_enclave_id == tap_null_enc_id ==> (untrusted_addr_valid[va] == valid &&
+  //            cpu.cpu_addr_valid == untrusted_addr_valid));
+  //ensures ((cpu.cpu_enclave_id == tap_null_enc_id && tap_addr_perm_v(valid)) ==>
+  //            (untrusted_addr_map[va] == pa && cpu.cpu_addr_map == untrusted_addr_map));
+  //ensures (cpu.cpu_enclave_id != tap_null_enc_id ==>
+  //        cpu.cpu_addr_valid == old(cpu.cpu_addr_valid));
+
+  modifies untrusted_addr_valid,
+           untrusted_addr_map,
+           cpu;
+{
+  if (cpu.cpu_enclave_id == tap_null_enc_id) {
+    untrusted_addr_valid[va] = valid;
+    call cpu.set_cpu_addr_valid(untrusted_addr_valid);
+    if (tap_addr_perm_v(valid)) {
+      untrusted_addr_map[va] = pa;
+      call cpu.set_cpu_addr_map(untrusted_addr_map);
+    }
+  }
+            
+}
+
+procedure [inline] get_enclave_addr_map(eid : tap_enclave_id_t, va  : vaddr_t)
+    returns (valid : addr_perm_t, paddr: wap_addr_t)
+    ensures (block_os_ev_read && (tap_enclave_metadata_addr_excl[eid])[va])
+            ==> (valid == k0_addr_perm_t && paddr == k0_wap_addr_t);
+    ensures (cpu.cpu_enclave_id != tap_null_enc_id || !tap_enclave_metadata_valid[eid])
+            ==> (valid == k0_addr_perm_t && paddr == k0_wap_addr_t);
+    ensures (cpu.cpu_enclave_id == tap_null_enc_id && tap_enclave_metadata_valid[eid] && (!block_os_ev_read || !((tap_enclave_metadata_addr_excl[eid])[va])))
+            ==> (valid == (tap_enclave_metadata_addr_valid[eid])[va] &&
+                 paddr == (tap_enclave_metadata_addr_map[eid])[va]);
+{
+  // default values
+  valid = k0_addr_perm_t;
+  paddr = k0_wap_addr_t;
+  if (cpu.cpu_enclave_id == tap_null_enc_id   &&
+      tap_enclave_metadata_valid[eid])
+  {
+    if (!block_os_ev_read || !((tap_enclave_metadata_addr_excl[eid])[va])) {
+      valid = (tap_enclave_metadata_addr_valid[eid])[va];
+      paddr = (tap_enclave_metadata_addr_map[eid])[va];
+    }
+  }
+}
+
+//TODO: Would this affect the free list?
+procedure [inline] set_enclave_addr_map(
+  eid    : tap_enclave_id_t,
+  va     : vaddr_t,
+  valid  : addr_perm_t,
+  paddr  : wap_addr_t
+)
+  returns (status : enclave_op_result_t)
+  modifies tap_enclave_metadata_addr_valid;
+  modifies tap_enclave_metadata_addr_map;
+{
+  // default values
+  if (cpu.cpu_enclave_id == tap_null_enc_id &&
+      tap_enclave_metadata_valid[eid])
+  {
+    if (!(tap_enclave_metadata_addr_excl[eid])[va]) {
+      var valid_map : addr_valid_t;
+      var addr_map  : addr_map_t;
+      valid_map = tap_enclave_metadata_addr_valid[eid];
+      addr_map  = tap_enclave_metadata_addr_map[eid];
+      valid_map[va] = valid;
+      addr_map[va]  = paddr;
+      tap_enclave_metadata_addr_valid[eid] = valid_map;
+      tap_enclave_metadata_addr_map[eid] = addr_map;
+      status = enclave_op_success;
+    } else {
+      status = enclave_op_invalid_arg;
+    } 
+  } else {
+    status = enclave_op_invalid_arg;
+  }
+}
+
+
+
+
+//
+// Helper definitions
+//
+define vaddr_alias(
+  av       : excl_vaddr_t,
+  am       : addr_map_t,
+  va1, va2 : vaddr_t) : boolean
+= (va1 != va2 && av[va1] && av[va2] && am[va1] == am[va2]);
+  
+  
+//
+// Launch and enclave
+//
+procedure [noinline] launch(
+  eid               : tap_enclave_id_t,
+  addr_valid        : addr_valid_t,
+  addr_map          : addr_map_t,
+  excl_vaddr        : excl_vaddr_t,
+  excl_paddr        : excl_map_t,
+  bounds            : bounds_t,
+  entrypoint        : vaddr_t
+)
+  returns (status : enclave_op_result_t)
+  //
+  // global TAP invariants
+  //
+  requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==>
+                  (cpu.cpu_owner_map[pa] != e));
+  ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==>
+                  (cpu.cpu_owner_map[pa] != e));
+
+   // Keep free pool consistent
+   requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+   ensures (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != eid) ==>
+              tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+   ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+   requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+
+  
+   //these postconditions say that nothing change if status != success
+  
+  ensures (status != enclave_op_success ==> cpu.cpu_owner_map == old(cpu.cpu_owner_map));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_valid == old(tap_enclave_metadata_valid));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_map == old(tap_enclave_metadata_addr_map));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_valid == old(tap_enclave_metadata_addr_valid));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_excl == old(tap_enclave_metadata_addr_excl));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_entrypoint == old(tap_enclave_metadata_entrypoint));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_regs == old(tap_enclave_metadata_regs));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_paused == old(tap_enclave_metadata_paused));
+  ensures (status != enclave_op_success ==> tap_enclave_metadata_cache_conflict == old(tap_enclave_metadata_cache_conflict));
+  ensures (status != enclave_op_success) ==> tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free);
+  ensures (status != enclave_op_success) ==> tap_enclave_metadata_bounds_valid == old(tap_enclave_metadata_bounds_valid);
+  ensures (status != enclave_op_success) ==> tap_enclave_metadata_region_bounds == old(tap_enclave_metadata_region_bounds);
+
+  
+   //these postconditions say that only entry [eid] changes in the maps
+  
+  ensures (forall (pa : wap_addr_t) ::
+            (status == enclave_op_success) ==>
+              (excl_paddr[pa] <==> cpu.cpu_owner_map[pa] == eid));
+  ensures (forall (pa : wap_addr_t) ::
+            status == enclave_op_success ==> 
+            (!excl_paddr[pa] ==> cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+  ensures (forall (pa : wap_addr_t) ::
+            status != enclave_op_success ==>
+              (cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==> 
+              tap_enclave_metadata_valid[e] == old(tap_enclave_metadata_valid)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_addr_valid[e] == old(tap_enclave_metadata_addr_valid)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_addr_excl[e] == old(tap_enclave_metadata_addr_excl)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==> 
+              tap_enclave_metadata_addr_map[e] == old(tap_enclave_metadata_addr_map)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_pc[e] == old(tap_enclave_metadata_pc)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_entrypoint[e] == old(tap_enclave_metadata_entrypoint)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_regs[e] == old(tap_enclave_metadata_regs)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_paused[e] == old(tap_enclave_metadata_paused)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_cache_conflict[e] == old(tap_enclave_metadata_cache_conflict)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid && e != tap_null_enc_id) ==>
+              tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_bounds_valid[e] == old(tap_enclave_metadata_bounds_valid)[e]);
+  ensures (forall (e : tap_enclave_id_t) ::
+            (e != eid) ==>
+              tap_enclave_metadata_region_bounds[e] == old(tap_enclave_metadata_region_bounds)[e]);
+    
+   //conditions which specify when we fail.
+  
+  ensures
+    ((cpu.cpu_enclave_id == tap_null_enc_id)                                                           &&
+     (valid_enclave_id(eid))                                                                       &&
+     (!old(tap_enclave_metadata_valid)[eid])                                                       &&
+     (tap_enclave_metadata_is_snapshot[eid] == false)                                              &&
+     (tap_addr_perm_x(addr_valid[entrypoint]))                                                     &&
+     (excl_paddr[addr_map[entrypoint]])                                                            &&
+     (excl_vaddr[entrypoint])                                                                      &&
+     (forall (pa : wap_addr_t) :: (excl_paddr[pa] ==> old(cpu.cpu_owner_map)[pa] == tap_null_enc_id))  && /* This line */
+     (forall (v : vaddr_t) :: excl_vaddr[v] ==> tap_addr_perm_v(addr_valid[v]))                       &&
+     (forall (v : vaddr_t) :: excl_vaddr[v] ==> excl_paddr[addr_map[v]])                              &&
+     (forall (v1, v2 : vaddr_t) :: !vaddr_alias(excl_vaddr, addr_map, v1, v2)) &&
+     (valid_bounds(bounds)) &&
+     (forall (pa: wap_addr_t) :: (in_bounds(pa, bounds) <==> excl_paddr[pa] == true)))
+  <==> (status == enclave_op_success);
+  ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+
+  //
+  // specify what changes when we succeed
+  //
+  ensures (status == enclave_op_success ==> (forall (pa : wap_addr_t) ::
+            (if (excl_paddr[pa]) then cpu.cpu_owner_map[pa] == eid
+                               else cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa])));
+  ensures (status == enclave_op_success) ==> (forall (pa : wap_addr_t) ::
+            if (excl_paddr[pa]) then cpu.cpu_owner_map[pa] == eid
+                              else cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]);
+  ensures (status == enclave_op_success) ==> (tap_enclave_metadata_valid[eid]);
+  ensures (status == enclave_op_success) ==> (tap_enclave_metadata_pc[eid] == entrypoint);
+  ensures (status == enclave_op_success) ==> (tap_enclave_metadata_entrypoint[eid] == entrypoint);
+  ensures (status == enclave_op_success) ==> (!tap_enclave_metadata_paused[eid]);
+  ensures (status == enclave_op_success) ==> (
+            (exists (p1, p2 : wap_addr_t) :: cpu.cpu_owner_map[p1] == eid &&
+                                             cpu.cpu_owner_map[p2] != eid &&
+                                             paddr2set(p1) == paddr2set(p2)) 
+            <==> tap_enclave_metadata_cache_conflict[eid]);
+  ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_regs[eid] == kzero_regs_t);
+  ensures (status == enclave_op_success) ==> 
+            (tap_enclave_metadata_addr_valid[eid] == addr_valid);
+  ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_addr_excl[eid] == excl_vaddr);
+  ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_addr_map[eid] == addr_map);
+  ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_bounds_valid[eid] == true);
+  ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_region_bounds[eid] == bounds);
+
+  //// additional invariants that hold upon success
+  ensures (status == enclave_op_success) ==>
+            (forall (v1, v2 : vaddr_t) ::
+              !vaddr_alias(tap_enclave_metadata_addr_excl[eid],
+                           tap_enclave_metadata_addr_map[eid], v1, v2));
+  ensures (status == enclave_op_success) ==>
+            (forall (v : vaddr_t) ::
+              (tap_enclave_metadata_addr_excl[eid])[v] ==>
+              (cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[eid])[v]] == eid));
+  ensures (status == enclave_op_success) ==>
+            (forall (v : vaddr_t) ::
+              (tap_enclave_metadata_addr_excl[eid])[v] ==>
+              tap_addr_perm_v((tap_enclave_metadata_addr_valid[eid])[v]));
+  ensures (status == enclave_op_success) ==>
+            (forall (p : wap_addr_t) ::
+                (!in_bounds(p, bounds) ==> tap_enclave_metadata_wap_addr_free[eid][p] == false));
+  ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) ::
+                    (in_bounds(p, bounds) && (forall (v : vaddr_t) :: addr_map[v] != p)) ==>  
+                            (tap_enclave_metadata_wap_addr_free[eid][p] == true));
+ ensures (status == enclave_op_success) ==>
+  (forall (p : wap_addr_t) ::
+      (in_bounds(p, bounds) && (exists (v : vaddr_t) :: addr_map[v] == p)) ==>  
+              (tap_enclave_metadata_wap_addr_free[eid][p] == false));
+  ensures (status == enclave_op_success) ==>
+             (tap_enclave_metadata_is_snapshot[eid] == false);
+
+
+
+
+  
+
+  // FAAS TAP invariants
+  modifies tap_enclave_metadata_valid;
+  modifies tap_enclave_metadata_addr_map;
+  modifies tap_enclave_metadata_addr_valid;
+  modifies tap_enclave_metadata_addr_excl;
+  modifies tap_enclave_metadata_entrypoint;
+  modifies tap_enclave_metadata_pc;
+  modifies tap_enclave_metadata_regs;
+  modifies tap_enclave_metadata_paused;
+  modifies tap_enclave_metadata_cache_conflict;
+  modifies tap_enclave_metadata_wap_addr_free;
+  modifies tap_enclave_metadata_bounds_valid;
+  modifies tap_enclave_metadata_region_bounds;
+  modifies cpu;
+{
+  var i, k             : integer;
+  var mappings_alias_v : boolean;
+  var paddr            : wap_addr_t;
+  var va               : vaddr_t;
+  var cache_conflict   : boolean;
+
+  
+  status = enclave_op_success;
+  
+  // ensure cpu mode is valid
+  if (cpu.cpu_enclave_id != tap_null_enc_id) { 
+     status = enclave_op_invalid_arg; 
+  }
+  
+  // ensure eid is valid
+  if (status != enclave_op_invalid_arg && 
+      (!valid_enclave_id(eid)           || 
+      tap_enclave_metadata_valid[eid]   ||
+      tap_enclave_metadata_is_snapshot[eid])) {
+     status = enclave_op_invalid_arg; 
+  }
+
+   // ensure bounds are valid
+  if (status != enclave_op_invalid_arg) {
+    if (!valid_bounds(bounds)) {
+        status = enclave_op_invalid_arg;
+    } else {
+        // Check that excl_paddr respects the bounds
+        var paddr: wap_addr_t;
+
+        paddr = k0_wap_addr_t;
+        while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg) 
+            invariant (status != enclave_op_invalid_arg) ==>
+                (forall (p : wap_addr_t) :: LT_wapa(p, paddr) ==> 
+                    (in_bounds(p, bounds) <==> excl_paddr[p] == true));
+        {
+            if ((!in_bounds(paddr, bounds) && excl_paddr[paddr] == true) || 
+                (in_bounds(paddr, bounds) && excl_paddr[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+            paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+        }
+
+        if (status != enclave_op_invalid_arg) {
+            assert paddr == kmax_wap_addr_t;
+            if ((!in_bounds(paddr, bounds) && excl_paddr[paddr] == true) || 
+                (in_bounds(paddr, bounds) && excl_paddr[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+        }
+    }
+  }
+
+
+  // the entrypoint must be mapped and exclusive
+  if (status != enclave_op_invalid_arg         &&
+      !tap_addr_perm_x(addr_valid[entrypoint]) ||
+      !excl_paddr[addr_map[entrypoint]]        ||
+      !excl_vaddr[entrypoint]) {
+     status = enclave_op_invalid_arg; 
+  }
+
+  if (status != enclave_op_invalid_arg) {
+    // ensure none of the paddrs are already exclusive
+    paddr = k0_wap_addr_t;
+    while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg)
+      invariant ((status != enclave_op_invalid_arg) ==>
+        (forall (pa : wap_addr_t) ::
+          ((LT_wapa(pa, paddr) && excl_paddr[pa]) ==>
+            cpu.cpu_owner_map[pa] == tap_null_enc_id)));
+      invariant ((status != enclave_op_invalid_arg) ==>
+        (forall (pa : wap_addr_t) ::
+          (LT_wapa(pa, paddr) ==> cpu.cpu_owner_map[pa] != eid)));
+    {
+      if (excl_paddr[paddr]) {
+        if (cpu.cpu_owner_map[paddr] != tap_null_enc_id) {
+          status = enclave_op_invalid_arg;
+        }
+      }
+      if (cpu.cpu_owner_map[paddr] == eid) {
+        status = enclave_op_invalid_arg;
+      }
+      paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+    }
+
+    if (status != enclave_op_invalid_arg) {
+      assert paddr == kmax_wap_addr_t;
+      if (excl_paddr[paddr]) {
+        if (cpu.cpu_owner_map[paddr] != tap_null_enc_id) {
+          status = enclave_op_invalid_arg;
+        }
+      }
+      if (cpu.cpu_owner_map[paddr] == eid) {
+        status = enclave_op_invalid_arg;
+      }
+
+    }
+  }
+
+  if (status != enclave_op_invalid_arg) {
+    // check if the private addresses alias with anything else (paddr)
+    call (mappings_alias_v) = do_mappings_alias_v(excl_vaddr, addr_map);
+    if (mappings_alias_v) {
+      status = enclave_op_invalid_arg;
+    }
+  }
+
+    
+  if (status != enclave_op_invalid_arg) {
+    
+    // check if the private virt addresses map to a shared phys addr
+    va = k0_vaddr_t;
+    while (LT_va(va, kmax_vaddr_t) && status != enclave_op_invalid_arg)
+      invariant ((status != enclave_op_invalid_arg) ==> 
+                    (forall (v : vaddr_t) ::
+                      (LT_va(v, va) && excl_vaddr[v]) ==> excl_paddr[addr_map[v]]));
+      invariant ((status != enclave_op_invalid_arg) ==> 
+                    (forall (v : vaddr_t) ::
+                      (LT_va(v, va) && excl_vaddr[v]) ==> tap_addr_perm_v(addr_valid[v])));
+    {
+      if (excl_vaddr[va]) {
+        if (!excl_paddr[addr_map[va]] || !tap_addr_perm_v(addr_valid[va])) {
+          status = enclave_op_invalid_arg; 
+        } 
+      }
+      va = PLUS_va(va, k1_vaddr_t);
+    }
+
+    if (status != enclave_op_invalid_arg) {
+      if (excl_vaddr[va]) {
+        if (!excl_paddr[addr_map[va]] || !tap_addr_perm_v(addr_valid[va])) {
+          status = enclave_op_invalid_arg; 
+        } 
+      }
+    }
+
+  }
+
+
+  if (status != enclave_op_invalid_arg) {
+    var mapped_wap_addrs : [wap_addr_t]boolean;
+
+
+    // Zero out this mapping, we use it to track some information later
+    assume (forall (w : wap_addr_t) :: mapped_wap_addrs[w] == false);
+
+
+
+    // Get all physical addresses in the page table (addr_map) that are exclusive
+    va = k0_vaddr_t;
+    while (LT_va(va, kmax_vaddr_t))
+      invariant (forall (v : vaddr_t) ::
+                      (LT_va(v, va) && excl_vaddr[v] ==> mapped_wap_addrs[addr_map[v]] == true));
+    {
+      if (in_bounds(addr_map[va], bounds)) {
+          mapped_wap_addrs[addr_map[va]] = true;
+      }
+      va = PLUS_va(va, k1_vaddr_t);
+    }
+
+    if (in_bounds(addr_map[va], bounds)) {
+        mapped_wap_addrs[addr_map[va]] = true;
+    }
+
+
+
+
+
+    // Set the CPU owner map.
+    paddr = k0_wap_addr_t;
+    while (LT_wapa(paddr, kmax_wap_addr_t))
+      invariant (forall (pa : wap_addr_t) ::
+                  (LT_wapa(pa, paddr) && excl_paddr[pa]) ==>
+                    cpu.cpu_owner_map[pa] == eid);
+      invariant (forall (pa : wap_addr_t) ::
+                  (LT_wapa(pa, paddr) && !excl_paddr[pa]) ==>
+                    cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]);
+      invariant (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != eid) ==>
+              tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+      invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+
+
+      invariant (forall (e : tap_enclave_id_t, pa : wap_addr_t) ::
+                  (e != eid && e != tap_null_enc_id) ==>
+                    (cpu.cpu_owner_map[pa] == e) ==> (cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+      invariant (forall (p : wap_addr_t) ::
+                    (LT_wapa(p, paddr) && in_bounds(p, bounds) && (forall (v : vaddr_t) :: addr_map[v] != p)) ==>  
+                            (tap_enclave_metadata_wap_addr_free[eid][p] == true));
+      invariant (forall (p : wap_addr_t) ::
+           (LT_wapa(p,paddr) && in_bounds(p, bounds) && (exists (v : vaddr_t) :: addr_map[v] == p)) ==>  
+                   (tap_enclave_metadata_wap_addr_free[eid][p] == false));
+
+
+  {
+      if (excl_paddr[paddr]) { 
+        var null_wap_free: [wap_addr_t]boolean;
+        var enc_wap_free: [wap_addr_t]boolean;
+        var va: vaddr_t;
+        var mapped: boolean;
+
+        mapped = false;
+        va = k0_vaddr_t;
+
+        call cpu.update_cpu_owner_map(paddr, eid); 
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[paddr] = false;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+
+        // Update free lists for enclaves
+        while (LT_va(va, kmax_vaddr_t) && mapped == false) 
+            invariant (forall (v : vaddr_t) :: (LT_va(v, va) && mapped == false) ==> addr_map[v] != paddr); 
+            invariant (exists (v : vaddr_t) :: (LT_va(v, va) && mapped == true)  ==> addr_map[v] == paddr);
+        {
+            if (addr_map[va] == paddr) {
+                mapped = true;
+            }
+            va = PLUS_va(va, k1_vaddr_t);
+        }
+
+        if (mapped == false) {
+            if (addr_map[va] == paddr) {
+                    mapped = true;
+            }
+        }
+
+
+        enc_wap_free = tap_enclave_metadata_wap_addr_free[eid];
+        enc_wap_free[paddr] = !mapped;
+        tap_enclave_metadata_wap_addr_free[eid] = enc_wap_free;
+      }
+      paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+  }
+    
+    //assert(false);
+
+    if (excl_paddr[paddr]) { 
+        var null_wap_free: [wap_addr_t]boolean;
+        var enc_wap_free: [wap_addr_t]boolean;
+        var mapped: boolean;
+        var va: vaddr_t;
+
+        mapped = false;
+        va = k0_vaddr_t;
+
+
+        call cpu.update_cpu_owner_map(paddr, eid); 
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[paddr] = false;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+
+        // Update free lists for enclaves
+        while (LT_va(va, kmax_vaddr_t) && mapped == false) 
+            invariant (forall (v : vaddr_t) :: (LT_va(v, va) && mapped == false) ==> addr_map[v] != paddr); 
+            invariant (exists (v : vaddr_t) :: (LT_va(v, va) && mapped == true)  ==> addr_map[v] == paddr);
+        {
+            if (addr_map[va] == paddr) {
+                mapped = true;
+            }
+            va = PLUS_va(va, k1_vaddr_t);
+        }
+
+        if (mapped == false) {
+            if (addr_map[va] == paddr) {
+                    mapped = true;
+            }
+        }
+
+        enc_wap_free = tap_enclave_metadata_wap_addr_free[eid];
+        enc_wap_free[paddr] = !mapped;
+        tap_enclave_metadata_wap_addr_free[eid] = enc_wap_free;
+    }
+
+    
+    // regs are zeroed out
+    call (cache_conflict) = does_enclave_conflict(eid);
+    
+    tap_enclave_metadata_valid[eid]           = true;
+    tap_enclave_metadata_addr_map[eid]        = addr_map;
+    tap_enclave_metadata_addr_valid[eid]      = addr_valid;
+    tap_enclave_metadata_addr_excl[eid]       = excl_vaddr;
+    tap_enclave_metadata_entrypoint[eid]      = entrypoint;
+    tap_enclave_metadata_pc[eid]              = entrypoint;
+    tap_enclave_metadata_regs[eid]            = kzero_regs_t;
+    tap_enclave_metadata_paused[eid]          = false;
+    tap_enclave_metadata_cache_conflict[eid]  = cache_conflict;
+    tap_enclave_metadata_region_bounds[eid]   = bounds;
+    tap_enclave_metadata_bounds_valid[eid]    = true;
+    status = enclave_op_success;
+  }
+  //assert(false);
+}
+  
+//
+// enter an enclave
+//
+procedure [noinline] enter(eid: tap_enclave_id_t)
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+    //----------------------------------------------------------------------//
+    // conditions for success or failure.                                   //
+    //----------------------------------------------------------------------//
+    ensures ((valid_enclave_id(eid))                   &&
+             !tap_enclave_metadata_is_snapshot[eid]    &&
+             (tap_enclave_metadata_valid[eid])         &&
+             (old(cpu.cpu_enclave_id) == tap_null_enc_id)) <==> (status == enclave_op_success);
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+                
+    //----------------------------------------------------------------------//
+    // nothing changes on failure.                                          //
+    //----------------------------------------------------------------------//
+    ensures (status != enclave_op_success ==> cpu.cpu_enclave_id == old(cpu.cpu_enclave_id));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status != enclave_op_success ==> (cpu.cpu_addr_map == old(cpu.cpu_addr_map)));
+    ensures (status != enclave_op_success ==> cpu.cpu_pc == old(cpu.cpu_pc));
+    ensures (status != enclave_op_success ==> untrusted_regs == old(untrusted_regs));
+    ensures (status != enclave_op_success ==> untrusted_addr_valid == old(untrusted_addr_valid));
+    ensures (status != enclave_op_success ==> untrusted_addr_map == old(untrusted_addr_map));
+    ensures (status != enclave_op_success ==> untrusted_pc == old(untrusted_pc));
+
+    //----------------------------------------------------------------------//
+    // state updates on success.                                            //
+    //----------------------------------------------------------------------//
+    ensures (status == enclave_op_success) ==> (untrusted_pc == old(cpu.cpu_pc));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_enclave_id == eid);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_pc == tap_enclave_metadata_entrypoint[eid]);
+    ensures (status == enclave_op_success) ==> (untrusted_regs == old(cpu.cpu_regs));
+    ensures (status == enclave_op_success) ==> (untrusted_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status == enclave_op_success) ==> (untrusted_addr_map == old(cpu.cpu_addr_map));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_valid == tap_enclave_metadata_addr_valid[eid]);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_map == tap_enclave_metadata_addr_map[eid]);
+    ensures (tap_addr_perm_x(old(cpu.cpu_addr_valid)[old(cpu.cpu_pc)])
+              ==> (status == enclave_op_success
+                    ==> tap_addr_perm_x(untrusted_addr_valid[untrusted_pc])));    
+
+    //
+    // Stuff that does not change at all
+    //
+    ensures cpu.cpu_mem == old(cpu.cpu_mem);
+    ensures (cpu.cpu_regs == old(cpu.cpu_regs));
+    ensures cpu.cpu_owner_map == old(cpu.cpu_owner_map);
+    ensures cpu.cpu_cache_enabled == old(cpu.cpu_cache_enabled);
+    ensures tap_enclave_metadata_parent == old(tap_enclave_metadata_parent);
+    ensures tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free);
+
+
+    modifies untrusted_regs;
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_pc;
+    modifies cpu;
+{
+    // no enclave id is null
+    // enclave must be valid and not baused
+    // cpu must be ready to execute enclaves
+    if (!valid_enclave_id(eid)                ||
+        !tap_enclave_metadata_valid[eid]      ||
+        tap_enclave_metadata_is_snapshot[eid] || // Snapshots should not run again
+        cpu.cpu_enclave_id != tap_null_enc_id)
+    {
+      status = enclave_op_invalid_arg;
+    } else {
+      status                  = enclave_op_success;
+      // save context
+      untrusted_regs          = cpu.cpu_regs;
+      untrusted_addr_valid    = cpu.cpu_addr_valid;
+      untrusted_addr_map      = cpu.cpu_addr_map;
+      untrusted_pc            = cpu.cpu_pc;
+      // restore enclave context
+      call cpu.set_cpu_state(eid,
+                             tap_enclave_metadata_addr_map[eid],
+                             tap_enclave_metadata_addr_valid[eid],
+                             tap_enclave_metadata_entrypoint[eid],
+                             cpu.cpu_regs);
+    }
+}
+
+
+//
+// Resume an enclave
+//
+procedure [noinline]  resume(eid: tap_enclave_id_t)
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+    //----------------------------------------------------------------------//
+    // conditions for success or failure.                                   //
+    //----------------------------------------------------------------------//
+    ensures ((valid_enclave_id(eid))                      &&
+             !tap_enclave_metadata_is_snapshot[eid]       &&
+             (tap_enclave_metadata_valid[eid])            && 
+             (tap_enclave_metadata_paused[eid])           &&
+             (old(cpu.cpu_enclave_id) == tap_null_enc_id))    ==> (status == enclave_op_success);
+    ensures ((!valid_enclave_id(eid))                     ||
+             (!tap_enclave_metadata_valid[eid])           || 
+             tap_enclave_metadata_is_snapshot[eid]        ||
+             (!tap_enclave_metadata_paused[eid])          ||
+             (old(cpu.cpu_enclave_id) != tap_null_enc_id))    ==> (status == enclave_op_invalid_arg);
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+
+    //----------------------------------------------------------------------//
+    // nothing changes on failure.                                          //
+    //----------------------------------------------------------------------//
+    ensures (status != enclave_op_success ==> cpu.cpu_regs == old(cpu.cpu_regs));
+    ensures (status != enclave_op_success ==> cpu.cpu_enclave_id == old(cpu.cpu_enclave_id));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_map == old(cpu.cpu_addr_map));
+    ensures (status != enclave_op_success ==> cpu.cpu_pc == old(cpu.cpu_pc));
+    ensures (status != enclave_op_success ==> untrusted_regs == old(untrusted_regs));
+    ensures (status != enclave_op_success ==> untrusted_addr_valid == old(untrusted_addr_valid));
+    ensures (status != enclave_op_success ==> untrusted_addr_map == old(untrusted_addr_map));
+    ensures (status != enclave_op_success ==> untrusted_pc == old(untrusted_pc));
+
+    //----------------------------------------------------------------------//
+    // state updates on success.                                            //
+    //----------------------------------------------------------------------//
+    ensures (status == enclave_op_success) ==> (untrusted_pc == old(cpu.cpu_pc));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_enclave_id == eid);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_pc == tap_enclave_metadata_pc[eid]);
+    ensures (status == enclave_op_success) ==> (untrusted_regs == old(cpu.cpu_regs));
+    ensures (status == enclave_op_success) ==> (untrusted_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status == enclave_op_success) ==> (untrusted_addr_map == old(cpu.cpu_addr_map));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_regs == tap_enclave_metadata_regs[eid]);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_valid == tap_enclave_metadata_addr_valid[eid]);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_map == tap_enclave_metadata_addr_map[eid]);
+    ensures (tap_addr_perm_x(old(cpu.cpu_addr_valid)[old(cpu.cpu_pc)])
+              ==> (status == enclave_op_success
+                    ==> tap_addr_perm_x(untrusted_addr_valid[untrusted_pc])));
+
+    modifies untrusted_regs;
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_pc;
+    modifies cpu;
+{
+  if (!valid_enclave_id(eid)                ||
+      !tap_enclave_metadata_valid[eid]      ||
+      !tap_enclave_metadata_paused[eid]     ||
+      tap_enclave_metadata_is_snapshot[eid] || // Snapshots should not run again
+      cpu.cpu_enclave_id != tap_null_enc_id) 
+  {
+    status = enclave_op_invalid_arg;
+  } else {
+    // save context
+    untrusted_regs                = cpu.cpu_regs;
+    untrusted_addr_valid          = cpu.cpu_addr_valid;
+    untrusted_addr_map            = cpu.cpu_addr_map;
+    untrusted_pc                  = cpu.cpu_pc;
+    // restore enclave context
+    call cpu.set_cpu_state(eid,
+                           tap_enclave_metadata_addr_map[eid],
+                           tap_enclave_metadata_addr_valid[eid],
+                           tap_enclave_metadata_pc[eid],
+                           tap_enclave_metadata_regs[eid]);
+    status = enclave_op_success;
+  }
+}
+
+
+// -------------------------------------------------------------------- //
+// Exit an enclave.                                                     //
+// -------------------------------------------------------------------- //
+procedure [noinline] exit()
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+               
+    //----------------------------------------------------------------------//
+    // success/failure conditions.                                          //
+    //----------------------------------------------------------------------//
+    ensures (old(cpu.cpu_enclave_id) == tap_null_enc_id) <==> (status == enclave_op_failed);
+    ensures (status == enclave_op_success || status == enclave_op_failed);
+
+    //----------------------------------------------------------------------//
+    // nothing changes on failure.                                          //
+    //----------------------------------------------------------------------//
+    ensures (status != enclave_op_success ==> cpu.cpu_regs == old(cpu.cpu_regs));
+    ensures (status != enclave_op_success ==> cpu.cpu_enclave_id == old(cpu.cpu_enclave_id));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_map == old(cpu.cpu_addr_map));
+    ensures (status != enclave_op_success ==> cpu.cpu_pc == old(cpu.cpu_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_valid == old(tap_enclave_metadata_addr_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_map == old(tap_enclave_metadata_addr_map));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_paused == old(tap_enclave_metadata_paused));
+    // nothing except eid changes for paused, pc, addr_valid and addr_map
+    ensures (forall (e : tap_enclave_id_t) :: 
+        e != old(cpu.cpu_enclave_id) ==> 
+            (tap_enclave_metadata_paused[e] == old(tap_enclave_metadata_paused)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: 
+        e != old(cpu.cpu_enclave_id) ==> 
+            (tap_enclave_metadata_pc[e] == old(tap_enclave_metadata_pc)[e]));
+    ensures (forall (e : tap_enclave_id_t) ::
+        e != old(cpu.cpu_enclave_id) ==>
+            tap_enclave_metadata_addr_valid[e] == old(tap_enclave_metadata_addr_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+        e != old(cpu.cpu_enclave_id) ==>
+            tap_enclave_metadata_addr_map[e] == old(tap_enclave_metadata_addr_map)[e]);
+
+    //----------------------------------------------------------------------//
+    // state updates on success.                                            //
+    //----------------------------------------------------------------------//
+    ensures (status == enclave_op_success) ==> (cpu.cpu_pc == old(untrusted_pc));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_enclave_id == tap_null_enc_id);
+    ensures (status == enclave_op_success) ==> (!tap_enclave_metadata_paused[old(cpu.cpu_enclave_id)]);
+    ensures (status == enclave_op_success) ==> 
+            (tap_enclave_metadata_pc[old(cpu.cpu_enclave_id)] == tap_enclave_metadata_entrypoint[old(cpu.cpu_enclave_id)]);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)] == old(cpu.cpu_addr_valid));
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_map[old(cpu.cpu_enclave_id)] == old(cpu.cpu_addr_map));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_regs == untrusted_regs);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_valid == untrusted_addr_valid);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_map == untrusted_addr_map);
+    ensures (tap_addr_perm_x(untrusted_addr_valid[untrusted_pc])
+              ==> (status == enclave_op_success 
+                    ==> tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc])));
+    ensures (status == enclave_op_success
+              ==> (cpu.cpu_owner_map[untrusted_addr_map[untrusted_pc]]
+                    == cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]]));
+
+
+
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_paused;
+    modifies cpu;
+{
+  var eid : tap_enclave_id_t;
+  
+  if (cpu.cpu_enclave_id == tap_null_enc_id) {
+    status = enclave_op_failed;
+  } else {
+    status = enclave_op_success;
+
+    eid                                   = cpu.cpu_enclave_id;
+    tap_enclave_metadata_addr_valid[eid]  = cpu.cpu_addr_valid;
+    tap_enclave_metadata_addr_map[eid]    = cpu.cpu_addr_map;
+    tap_enclave_metadata_pc[eid]          = tap_enclave_metadata_entrypoint[eid];
+    tap_enclave_metadata_paused[eid]      = false;
+    
+    call cpu.set_cpu_state(tap_null_enc_id,
+                           untrusted_addr_map,
+                           untrusted_addr_valid,
+                           untrusted_pc,
+                           untrusted_regs);
+    status = enclave_op_success;
+  }
+}
+
+
+//
+// Pause an enclave
+//
+procedure [noinline] pause()
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+    //----------------------------------------------------------------------//
+    // success/failure conditions.                                          //
+    //----------------------------------------------------------------------//
+    ensures (old(cpu.cpu_enclave_id) == tap_null_enc_id) ==> (status == enclave_op_failed);
+    ensures (old(cpu.cpu_enclave_id) != tap_null_enc_id) ==> (status == enclave_op_success);
+    ensures (status == enclave_op_success || status == enclave_op_failed);
+               
+    //----------------------------------------------------------------------//
+    // nothing changes on failure.                                          //
+    //----------------------------------------------------------------------//
+    ensures (status != enclave_op_success ==> cpu.cpu_regs == old(cpu.cpu_regs));
+    ensures (status != enclave_op_success ==> cpu.cpu_enclave_id == old(cpu.cpu_enclave_id));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_valid == old(cpu.cpu_addr_valid));
+    ensures (status != enclave_op_success ==> cpu.cpu_addr_map == old(cpu.cpu_addr_map));
+    ensures (status != enclave_op_success ==> cpu.cpu_pc == old(cpu.cpu_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_regs == old(tap_enclave_metadata_regs));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_valid == old(tap_enclave_metadata_addr_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_map == old(tap_enclave_metadata_addr_map));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_paused == old(tap_enclave_metadata_paused));
+    // nothing except eid changes for paused, pc, regs, addr_valid and addr_map
+    ensures (forall (e : tap_enclave_id_t) :: 
+        e != old(cpu.cpu_enclave_id) ==> 
+            (tap_enclave_metadata_paused[e] == old(tap_enclave_metadata_paused)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: 
+        e != old(cpu.cpu_enclave_id) ==> 
+            (tap_enclave_metadata_pc[e] == old(tap_enclave_metadata_pc)[e]));
+    ensures (forall (e : tap_enclave_id_t) ::
+        e != old(cpu.cpu_enclave_id) ==>
+            tap_enclave_metadata_regs[e] == old(tap_enclave_metadata_regs)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+        e != old(cpu.cpu_enclave_id) ==>
+            tap_enclave_metadata_addr_valid[e] == old(tap_enclave_metadata_addr_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+        e != old(cpu.cpu_enclave_id) ==>
+            tap_enclave_metadata_addr_map[e] == old(tap_enclave_metadata_addr_map)[e]);
+
+    //----------------------------------------------------------------------//
+    // state updates on success.                                            //
+    //----------------------------------------------------------------------//
+    ensures (status == enclave_op_success) ==> (cpu.cpu_pc == old(untrusted_pc));
+    ensures (status == enclave_op_success) ==> (cpu.cpu_enclave_id == tap_null_enc_id);
+    ensures (status == enclave_op_success) ==> (tap_enclave_metadata_paused[old(cpu.cpu_enclave_id)] == true);
+    ensures (status == enclave_op_success) ==> 
+            (tap_enclave_metadata_pc[old(cpu.cpu_enclave_id)] == old(cpu.cpu_pc));
+    ensures (status == enclave_op_success) ==>
+            (tap_enclave_metadata_regs[old(cpu.cpu_enclave_id)] == old(cpu.cpu_regs));
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)] == old(cpu.cpu_addr_valid));
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_map[old(cpu.cpu_enclave_id)] == old(cpu.cpu_addr_map));
+    ensures (status == enclave_op_success) ==>
+            (cpu.cpu_regs == untrusted_regs);
+    ensures (status == enclave_op_success) ==>
+            (cpu.cpu_addr_valid == untrusted_addr_valid);
+    ensures (status == enclave_op_success) ==>
+            (cpu.cpu_addr_map == untrusted_addr_map);
+    ensures (tap_addr_perm_x(untrusted_addr_valid[untrusted_pc])
+              ==> (status == enclave_op_success 
+                    ==> tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc])));
+    ensures (status == enclave_op_success
+              ==> (cpu.cpu_owner_map[untrusted_addr_map[untrusted_pc]]
+                    == cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]]));
+
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_paused;
+    modifies cpu;
+
+{
+  var eid : tap_enclave_id_t;
+    
+  if (cpu.cpu_enclave_id == tap_null_enc_id) {
+    status = enclave_op_failed;
+  } else {
+
+    eid                                  = cpu.cpu_enclave_id;
+    tap_enclave_metadata_regs[eid]       = cpu.cpu_regs;
+    tap_enclave_metadata_addr_valid[eid] = cpu.cpu_addr_valid;
+    tap_enclave_metadata_addr_map[eid]   = cpu.cpu_addr_map;
+    tap_enclave_metadata_pc[eid]         = cpu.cpu_pc;
+    tap_enclave_metadata_paused[eid]     = true;
+
+    call cpu.set_cpu_state(tap_null_enc_id,
+                           untrusted_addr_map,
+                           untrusted_addr_valid,
+                           untrusted_pc,
+                           untrusted_regs);
+    status = enclave_op_success;
+  }
+}
+
+
+//
+// Destroy an enclave
+//
+procedure [noinline] destroy(eid: tap_enclave_id_t)
+    returns (status: enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+    //----------------------------------------------------------------------//
+    // success/failure conditions.                                          //
+    //----------------------------------------------------------------------//
+    ensures (!valid_enclave_id(eid)                 || 
+             !old(tap_enclave_metadata_valid)[eid]  || 
+             cpu.cpu_enclave_id != tap_null_enc_id  ||
+             old(tap_enclave_metadata_child_count)[eid] > 0) ==> (status == enclave_op_invalid_arg);
+    ensures (valid_enclave_id(eid)                  && 
+             old(tap_enclave_metadata_valid)[eid]   && 
+             cpu.cpu_enclave_id == tap_null_enc_id  &&
+             old(tap_enclave_metadata_child_count)[eid] == 0) ==> (status == enclave_op_success);
+    ensures (valid_enclave_id(eid)                  && 
+             old(tap_enclave_metadata_valid)[eid]   && 
+             cpu.cpu_enclave_id == tap_null_enc_id  &&
+             old(tap_enclave_metadata_child_count)[eid] == 0) <==> (status == enclave_op_success);
+
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+
+    //----------------------------------------------------------------------//
+    // nothing changes on failure.                                          //
+    //----------------------------------------------------------------------//
+    ensures (status != enclave_op_success ==> cpu.cpu_owner_map == old(cpu.cpu_owner_map));
+    ensures (status != enclave_op_success ==> cpu.cpu_pc == old(cpu.cpu_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_regs == old(tap_enclave_metadata_regs));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_valid == old(tap_enclave_metadata_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_bounds_valid == old(tap_enclave_metadata_bounds_valid));
+    ensures (status != enclave_op_success) ==> tap_enclave_metadata_is_snapshot == old(tap_enclave_metadata_is_snapshot);
+    ensures (status != enclave_op_success) ==> tap_enclave_metadata_child_count == old(tap_enclave_metadata_child_count);
+    ensures (status != enclave_op_success) ==> tap_enclave_metadata_parent == old(tap_enclave_metadata_parent);
+
+
+    // regs don't change except for eid.
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid) ==> tap_enclave_metadata_regs[e] == old(tap_enclave_metadata_regs)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid && e != tap_blocked_enc_id) ==> tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid) ==> tap_enclave_metadata_bounds_valid[e] == old(tap_enclave_metadata_bounds_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != old(tap_enclave_metadata_parent)[eid]) ==> tap_enclave_metadata_child_count[e] == old(tap_enclave_metadata_child_count)[e]);
+
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid) ==> tap_enclave_metadata_valid[e] == old(tap_enclave_metadata_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid) ==> tap_enclave_metadata_is_snapshot[e] == old(tap_enclave_metadata_is_snapshot)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (e != eid) ==> tap_enclave_metadata_parent[e] == old(tap_enclave_metadata_parent)[e]);
+
+    ensures (forall (p : wap_addr_t) :: old(cpu.cpu_owner_map)[p] != eid ==> cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]);
+
+    //----------------------------------------------------------------------//
+    // status updates on success                                            //
+    //----------------------------------------------------------------------//
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) ::
+                    (if (old(cpu.cpu_owner_map)[p] == eid)
+                        then (cpu.cpu_owner_map[p] == tap_blocked_enc_id)
+                        else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p])));
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) ::
+                    old(cpu.cpu_owner_map)[p] == eid ==>
+                        (cpu.cpu_owner_map[p] == tap_blocked_enc_id));
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) ::
+                    old(cpu.cpu_owner_map)[p] != eid ==> 
+                        cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]);
+    ensures (status == enclave_op_success) ==>
+                (forall (e : tap_enclave_id_t) :: 
+                    tap_enclave_metadata_valid[e] == 
+                        (if (e == eid) then false
+                                     else old(tap_enclave_metadata_valid)[e]));
+    ensures (status == enclave_op_success) ==>
+                (forall (e : tap_enclave_id_t) :: 
+                    tap_enclave_metadata_pc[e] == 
+                        (if (e == eid) then k0_vaddr_t
+                                     else old(tap_enclave_metadata_pc)[e]));
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_regs[eid] == kzero_regs_t);
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_is_snapshot[eid] == false);
+    ensures (status == enclave_op_success) ==>
+                (forall (e : tap_enclave_id_t, p : wap_addr_t) ::
+                    (e == eid) ==> tap_enclave_metadata_wap_addr_free[eid][p] == false);
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) ::
+                    ((old(cpu.cpu_owner_map)[p] == eid) ==> tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == true) &&
+                    ((old(cpu.cpu_owner_map)[p] != eid) ==> tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_blocked_enc_id][p]));
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_parent[eid] != tap_invalid_enc_id ==> tap_enclave_metadata_child_count[tap_enclave_metadata_parent[eid]] == old(tap_enclave_metadata_child_count)[tap_enclave_metadata_parent[eid]] - 1);
+    ensures (status == enclave_op_success) ==>
+                tap_enclave_metadata_parent[eid] == tap_invalid_enc_id;
+                     
+
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_bounds_valid;
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies tap_enclave_metadata_child_count;
+    modifies tap_enclave_metadata_parent;
+    modifies cpu;
+{
+  var va : wap_addr_t;
+  var pa : wap_addr_t;
+  var eid_wap_addr_free: [wap_addr_t]boolean;
+  var blocked_wap_addr_free: [wap_addr_t]boolean;
+
+  
+  status = enclave_op_success;
+
+  // no enclave_id is null
+  if (!valid_enclave_id(eid) || 
+      !tap_enclave_metadata_valid[eid] || 
+      cpu.cpu_enclave_id != tap_null_enc_id ||
+      tap_enclave_metadata_child_count[eid] > 0)
+ {
+    status = enclave_op_invalid_arg;
+  } else {
+
+    assert (cpu.cpu_enclave_id != eid);
+    assert tap_enclave_metadata_valid[eid];
+
+    // we have to clear out the enclave's registers and memory.
+    pa = k0_wap_addr_t;
+    while (LT_wapa(pa, kmax_wap_addr_t))
+      invariant (forall (p : wap_addr_t) ::
+                  LT_wapa(p, pa) ==>
+                    (if (old(cpu.cpu_owner_map)[p] == eid)
+                        then (cpu.cpu_owner_map[p] == tap_blocked_enc_id)
+                        else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p])));
+      invariant (forall (p: wap_addr_t) ::
+                    LT_wapa(p, pa) ==>
+                        tap_enclave_metadata_wap_addr_free[eid][p] == false);
+      invariant (forall (p: wap_addr_t) ::
+                    (LT_wapa(p, pa) && old(cpu.cpu_owner_map)[p] == eid) ==>
+                        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == true);
+      invariant (forall (p: wap_addr_t) ::
+                    (LT_wapa(p, pa) && old(cpu.cpu_owner_map)[p] != eid) ==>
+                        (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_blocked_enc_id][p]));
+
+      invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+      invariant (forall (e : tap_enclave_id_t) ::
+                (e != eid && e != tap_blocked_enc_id) ==> tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+      invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && old(cpu.cpu_owner_map)[p] == eid)
+                      then (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == true)
+                      else (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_blocked_enc_id][p]));
+    {
+      assert (eid != tap_blocked_enc_id);
+      if (cpu.cpu_owner_map[pa] == eid) {
+        
+        call cpu.update_cpu_owner_map(pa, tap_blocked_enc_id);
+
+        blocked_wap_addr_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+        blocked_wap_addr_free[pa] = true;
+        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_addr_free;
+      }
+
+      eid_wap_addr_free = tap_enclave_metadata_wap_addr_free[eid];
+      eid_wap_addr_free[pa] = false;
+      tap_enclave_metadata_wap_addr_free[eid] = eid_wap_addr_free;
+
+      pa = PLUS_wapa(pa, k1_wap_addr_t);
+    }
+
+    assert pa == kmax_wap_addr_t;
+
+
+    if (cpu.cpu_owner_map[pa] == eid) {
+      call cpu.update_cpu_owner_map(pa, tap_blocked_enc_id);
+
+      blocked_wap_addr_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+      blocked_wap_addr_free[pa] = true;
+      tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_addr_free;
+    }
+
+    eid_wap_addr_free = tap_enclave_metadata_wap_addr_free[eid];
+    eid_wap_addr_free[pa] = false;
+    tap_enclave_metadata_wap_addr_free[eid] = eid_wap_addr_free;
+
+    assert (forall (p : wap_addr_t) ::
+              (if (old(cpu.cpu_owner_map)[p] == eid)
+                  then (cpu.cpu_owner_map[p] == tap_blocked_enc_id)
+                  else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p])));
+    assert (forall (p : wap_addr_t) ::
+              (old(cpu.cpu_owner_map)[p] == eid) ==> 
+                (cpu.cpu_owner_map[p] == tap_blocked_enc_id));
+    assert (forall (p : wap_addr_t) ::
+              (old(cpu.cpu_owner_map)[p] != eid) ==>
+                (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]));
+    assert (forall (p : wap_addr_t) ::
+              (old(cpu.cpu_owner_map)[p] != eid) ==> cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]);
+
+    // and now we mark the enclave invalid
+    tap_enclave_metadata_valid[eid] = false;
+    tap_enclave_metadata_is_snapshot[eid] = false;
+    tap_enclave_metadata_regs[eid]  = kzero_regs_t;
+    tap_enclave_metadata_pc[eid]    = k0_vaddr_t;
+    tap_enclave_metadata_bounds_valid[eid] = false;
+    if (tap_enclave_metadata_parent[eid] != tap_invalid_enc_id) {
+        assert(tap_enclave_metadata_child_count[tap_enclave_metadata_parent[eid]] > 0);
+        tap_enclave_metadata_child_count[tap_enclave_metadata_parent[eid]] = tap_enclave_metadata_child_count[tap_enclave_metadata_parent[eid]] - 1;
+    }
+    tap_enclave_metadata_parent[eid] = tap_invalid_enc_id;
+    
+  }
+}
+
+
+//
+// Block available memory
+//
+procedure [noinline] block_memory_region(bmap : excl_map_t, bounds: bounds_t)
+   returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+
+
+
+    // success condition.
+    ensures ((forall (p : wap_addr_t) ::
+                bmap[p] ==> (old(cpu.cpu_owner_map)[p] == tap_null_enc_id)) && 
+             (valid_bounds(bounds)) &&
+             (forall (p : wap_addr_t) :: in_bounds(p, bounds) <==> bmap[p] == true))
+            <==> (status == enclave_op_success);
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+
+    // effect on cpu.cpu_owner_map
+    ensures (status == enclave_op_success) ==>
+            (forall (p : wap_addr_t) :: 
+                if (bmap[p]) 
+                    then cpu.cpu_owner_map[p] == tap_blocked_enc_id
+                    else cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]);
+    ensures (status != enclave_op_success) ==> 
+                old(cpu.cpu_owner_map) == cpu.cpu_owner_map;
+
+    // effect on wap_addr_free
+    ensures (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != tap_blocked_enc_id) ==>
+        (tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]));
+    ensures (status != enclave_op_success) ==> 
+                tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free);
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) :: bmap[p] ==>
+                    (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == false && 
+                     tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == true));
+    
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies cpu;
+{
+  var pa : wap_addr_t;
+  // First make sure that all the addresses in bmap are blocked
+  pa = k0_wap_addr_t;
+
+  //Ensures that we dont simply terminate initially
+  status = enclave_op_success;
+
+  // ensure bounds are valid
+  if (status != enclave_op_invalid_arg) {
+    if (!valid_bounds(bounds)) {
+        status = enclave_op_invalid_arg;
+    } else {
+        // Check that excl_paddr respects the bounds
+        var paddr: wap_addr_t;
+
+        paddr = k0_wap_addr_t;
+        while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg) 
+            invariant (status != enclave_op_invalid_arg) ==>
+                (forall (p : wap_addr_t) :: LT_wapa(p, paddr) ==> 
+                    (in_bounds(p, bounds) <==> bmap[p] == true));
+        {
+            if ((!in_bounds(paddr, bounds) && bmap[paddr] == true) || 
+                (in_bounds(paddr, bounds) && bmap[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+            paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+        }
+
+        if (status != enclave_op_invalid_arg) {
+            assert paddr == kmax_wap_addr_t;
+            if ((!in_bounds(paddr, bounds) && bmap[paddr] == true) || 
+                (in_bounds(paddr, bounds) && bmap[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+        }
+    }
+  }
+
+  while (LT_wapa(pa, kmax_wap_addr_t) && status != enclave_op_invalid_arg)
+    invariant ((status != enclave_op_invalid_arg) ==> 
+                (forall (p : wap_addr_t) ::
+                  (LT_wapa(p, pa) && bmap[p]) ==> (cpu.cpu_owner_map[p] == tap_null_enc_id)));
+  {
+    if (bmap[pa] && (cpu.cpu_owner_map[pa] != tap_null_enc_id)) {
+      status = enclave_op_invalid_arg;
+    }
+    
+    pa = PLUS_wapa(pa, k1_wap_addr_t);
+  }
+
+  
+  if ((status != enclave_op_invalid_arg) && bmap[pa] && (cpu.cpu_owner_map[pa] != tap_null_enc_id)) {
+      status = enclave_op_invalid_arg;
+  }
+  
+  if (status != enclave_op_invalid_arg) {
+    assert (forall (p : wap_addr_t) :: bmap[p] ==> (cpu.cpu_owner_map[p] == tap_null_enc_id));
+
+    // NOw go around clearing each address in bmap
+    pa = k0_wap_addr_t;
+    while (LT_wapa(pa, kmax_wap_addr_t))
+      invariant (forall (p : wap_addr_t) :: bmap[p] ==>
+                  (if (LT_wapa(p, pa))
+                       then cpu.cpu_owner_map[p] == tap_blocked_enc_id
+                       else cpu.cpu_owner_map[p] == tap_null_enc_id));
+      invariant (forall (p : wap_addr_t) ::
+                  (if (LT_wapa(p, pa) && bmap[p])
+                       then cpu.cpu_owner_map[p] == tap_blocked_enc_id
+                       else cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]));
+      invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && bmap[p])
+                      then (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == false)
+                      else (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_null_enc_id][p]));
+       invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && bmap[p])
+                      then (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == true)
+                      else (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_blocked_enc_id][p]));
+       invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+       invariant (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != tap_blocked_enc_id) ==>
+        (tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]));
+
+
+
+    {
+      if (bmap[pa]) {
+        var null_wap_free: [wap_addr_t]boolean;
+        var blocked_wap_free: [wap_addr_t]boolean;
+        call cpu.update_cpu_owner_map(pa, tap_blocked_enc_id);
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[pa] = false;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+        blocked_wap_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+        blocked_wap_free[pa] = true;
+        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_free;
+
+      }
+      pa = PLUS_wapa(pa, k1_wap_addr_t);
+    }
+
+    assert pa == kmax_wap_addr_t;
+    if (bmap[pa]) {
+        var null_wap_free: [wap_addr_t]boolean;
+        var blocked_wap_free: [wap_addr_t]boolean;
+        call cpu.update_cpu_owner_map(pa, tap_blocked_enc_id);
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[pa] = false;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+        blocked_wap_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+        blocked_wap_free[pa] = true;
+        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_free;
+
+    }
+
+
+    assert (forall (p : wap_addr_t) ::
+            if (bmap[p])
+               then (cpu.cpu_owner_map[p] == tap_blocked_enc_id)
+               else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p]));
+    status = enclave_op_success;
+  }
+}
+
+
+//
+// Reclaim blocked memory
+//
+procedure [noinline] release_blocked_memory(bmap : excl_map_t, bounds: bounds_t)
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+    // success condition.
+    ensures ((forall (p : wap_addr_t) ::
+                bmap[p] ==> (old(cpu.cpu_owner_map)[p] == tap_blocked_enc_id)) && 
+             (valid_bounds(bounds)) &&
+             (forall (p : wap_addr_t) :: in_bounds(p, bounds) <==> bmap[p] == true))
+            <==> (status == enclave_op_success);
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+
+    // effect on cpu.cpu_owner_map
+    ensures (status == enclave_op_success) ==>
+            (forall (p : wap_addr_t) :: 
+                if (bmap[p])
+                    then (cpu.cpu_owner_map[p] == tap_null_enc_id && 
+                          cpu.cpu_mem[p] == k0_word_t)
+                    else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p] && 
+                          cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]));
+    ensures (status != enclave_op_success) ==> 
+                (old(cpu.cpu_owner_map) == cpu.cpu_owner_map &&
+                 old(tap_enclave_metadata_wap_addr_free) == tap_enclave_metadata_wap_addr_free &&
+                 old(cpu.cpu_mem) == cpu.cpu_mem);
+
+    // effect on wap_addr_free
+    ensures (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != tap_blocked_enc_id) ==>
+        (tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]));
+    ensures (status != enclave_op_success) ==> 
+                tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free);
+    ensures (status == enclave_op_success) ==>
+                (forall (p : wap_addr_t) :: bmap[p] ==>
+                    (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == true && 
+                     tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == false));
+
+
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies cpu;
+{
+  var pa : wap_addr_t;
+  // First make sure that all the addresses in bmap are blocked
+  pa = k0_wap_addr_t;
+
+  //Ensures that we dont simply terminate initially
+  status = enclave_op_success;
+
+   // ensure bounds are valid
+  if (status != enclave_op_invalid_arg) {
+    if (!valid_bounds(bounds)) {
+        status = enclave_op_invalid_arg;
+    } else {
+        // Check that excl_paddr respects the bounds
+        var paddr: wap_addr_t;
+
+        paddr = k0_wap_addr_t;
+        while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg) 
+            invariant (status != enclave_op_invalid_arg) ==>
+                (forall (p : wap_addr_t) :: LT_wapa(p, paddr) ==> 
+                    (in_bounds(p, bounds) <==> bmap[p] == true));
+        {
+            if ((!in_bounds(paddr, bounds) && bmap[paddr] == true) || 
+                (in_bounds(paddr, bounds) && bmap[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+            paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+        }
+
+        if (status != enclave_op_invalid_arg) {
+            if ((!in_bounds(paddr, bounds) && bmap[paddr] == true) || 
+                (in_bounds(paddr, bounds) && bmap[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+        }
+
+    }
+  }
+
+
+
+  while (LT_wapa(pa, kmax_wap_addr_t) && status != enclave_op_invalid_arg)
+    invariant ((status != enclave_op_invalid_arg) ==>
+                  (forall (p : wap_addr_t) ::
+                    (LT_wapa(p, pa) && bmap[p]) ==> (cpu.cpu_owner_map[p] == tap_blocked_enc_id)));
+  
+  {
+    if (bmap[pa] && cpu.cpu_owner_map[pa] != tap_blocked_enc_id) {
+      status = enclave_op_invalid_arg;
+    }
+    pa = PLUS_wapa(pa, k1_wap_addr_t);
+  }
+  if (status != enclave_op_invalid_arg && bmap[pa] && cpu.cpu_owner_map[pa] != tap_blocked_enc_id) {
+    status = enclave_op_invalid_arg;
+  }
+
+  if (status != enclave_op_invalid_arg) {
+    assert (forall (p : wap_addr_t) :: bmap[p] ==> (cpu.cpu_owner_map[p] == tap_blocked_enc_id));
+
+    // Now go around clearing each address in bmap
+    pa = k0_wap_addr_t;
+    while (LT_wapa(pa, kmax_wap_addr_t))
+      invariant (forall (p : wap_addr_t) :: bmap[p] ==>
+                  (if (LT_wapa(p, pa))
+                      then cpu.cpu_owner_map[p] == tap_null_enc_id
+                      else cpu.cpu_owner_map[p] == tap_blocked_enc_id));
+      invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && bmap[p])
+                      then (cpu.cpu_owner_map[p] == tap_null_enc_id && cpu.cpu_mem[p] == k0_word_t)
+                      else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p] && cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]));
+      invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && bmap[p])
+                      then (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == true)
+                      else (tap_enclave_metadata_wap_addr_free[tap_null_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_null_enc_id][p]));
+       invariant (forall (p : wap_addr_t) ::
+                  if (LT_wapa(p, pa) && bmap[p])
+                      then (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == false)
+                      else (tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id][p] == old(tap_enclave_metadata_wap_addr_free)[tap_blocked_enc_id][p]));
+
+       invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+       invariant (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != tap_blocked_enc_id) ==>
+        (tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]));
+
+
+    {
+      if (bmap[pa]) {
+        var null_wap_free: [wap_addr_t]boolean;
+        var blocked_wap_free: [wap_addr_t]boolean;
+        call cpu.update_cpu_owner_map(pa, tap_null_enc_id);
+        call cpu.update_cpu_mem(pa, k0_word_t);
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[pa] = true;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+        blocked_wap_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+        blocked_wap_free[pa] = false;
+        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_free;
+      }
+      pa = PLUS_wapa(pa, k1_wap_addr_t);
+    }
+
+    assert pa == kmax_wap_addr_t;
+
+    if (bmap[pa]) {
+        var null_wap_free: [wap_addr_t]boolean;
+        var blocked_wap_free: [wap_addr_t]boolean;
+        call cpu.update_cpu_owner_map(pa, tap_null_enc_id);
+        call cpu.update_cpu_mem(pa, k0_word_t);
+
+        null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+        null_wap_free[pa] = true;
+        tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+        blocked_wap_free = tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id];
+        blocked_wap_free[pa] = false;
+        tap_enclave_metadata_wap_addr_free[tap_blocked_enc_id] = blocked_wap_free;
+    }
+
+    assert (forall (p : wap_addr_t) ::
+              if (bmap[p])
+                 then (cpu.cpu_owner_map[p] == tap_null_enc_id && cpu.cpu_mem[p] == k0_word_t)
+                 else (cpu.cpu_owner_map[p] == old(cpu.cpu_owner_map)[p] && cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]));
+    status = enclave_op_success;
+  }
+}
+
+
+// 
+// Extra stuff for FAAS enclaves
+//
+// TODO: Want to show that a frozen parent cannot write to its memory
+procedure [noinline] snapshot() 
+    returns (status : enclave_op_result_t)
+
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+
+
+    // Snapshot specific invariants
+
+    // Specify state that does not change
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_addr_map[e] == old(tap_enclave_metadata_addr_map)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_paused[e] == old(tap_enclave_metadata_paused)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_pc[e] == old(tap_enclave_metadata_pc)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_is_snapshot[e] == old(tap_enclave_metadata_is_snapshot)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_addr_valid[e] == old(tap_enclave_metadata_addr_valid)[e]));
+    ensures (forall (e : tap_enclave_id_t) :: (e != old(cpu.cpu_enclave_id)) ==> (tap_enclave_metadata_postinit_measurement[e] == old(tap_enclave_metadata_postinit_measurement)[e]));
+
+    // Failure/Success condition
+
+    ensures (status == enclave_op_success || status == enclave_op_failed);
+    ensures (valid_enclave_id(old(cpu.cpu_enclave_id)) && 
+             tap_enclave_metadata_is_snapshot[old(cpu.cpu_enclave_id)] == false) 
+                ==> (status == enclave_op_success);
+    ensures !(valid_enclave_id(old(cpu.cpu_enclave_id)) && 
+             old(tap_enclave_metadata_is_snapshot)[old(cpu.cpu_enclave_id)] == false) 
+                ==> (status == enclave_op_failed);
+    
+
+
+    // Nothing happens on failure
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_addr_map == old(tap_enclave_metadata_addr_map));
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_paused == old(tap_enclave_metadata_paused));
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_is_snapshot == old(tap_enclave_metadata_is_snapshot));
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_addr_valid == old(tap_enclave_metadata_addr_valid));
+    ensures (status == enclave_op_failed) ==> (tap_enclave_metadata_postinit_measurement == old(tap_enclave_metadata_postinit_measurement));
+    ensures (status == enclave_op_failed) ==> cpu.cpu_mem == old(cpu.cpu_mem);
+    ensures (status == enclave_op_failed) ==> cpu.cpu_regs == old(cpu.cpu_regs);
+    ensures (status == enclave_op_failed) ==> cpu.cpu_pc == old(cpu.cpu_pc); 
+    ensures (status == enclave_op_failed) ==> cpu.cpu_enclave_id == old(cpu.cpu_enclave_id);
+    ensures (status == enclave_op_failed) ==> cpu.cpu_addr_valid == old(cpu.cpu_addr_valid);
+    ensures (status == enclave_op_failed) ==> cpu.cpu_addr_map == old(cpu.cpu_addr_map);
+    ensures (status == enclave_op_failed) ==> cpu.cpu_owner_map == old(cpu.cpu_owner_map);
+
+    // Stuff that doesn't change
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_addr_map[eid] == old(tap_enclave_metadata_addr_map)[eid]);
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_paused[eid] == old(tap_enclave_metadata_paused)[eid]);
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_pc[eid] == old(tap_enclave_metadata_pc)[eid]);
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_is_snapshot[eid] == old(tap_enclave_metadata_is_snapshot)[eid]);
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_addr_valid[eid] == old(tap_enclave_metadata_addr_valid)[eid]);
+    ensures (forall (eid : tap_enclave_id_t) ::
+                eid != old(cpu.cpu_enclave_id) ==>
+                tap_enclave_metadata_postinit_measurement[eid] == old(tap_enclave_metadata_postinit_measurement)[eid]);
+
+
+
+    // What happens on success
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_is_snapshot[old(cpu.cpu_enclave_id)] == true);
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    tap_addr_perm_w(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == false);
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    (tap_addr_perm_v(old(cpu.cpu_addr_valid)[v])  &&
+                     tap_addr_perm_w(old(cpu.cpu_addr_valid)[v])  &&
+                     !tap_addr_perm_r(old(cpu.cpu_addr_valid)[v]) &&
+                     !tap_addr_perm_x(old(cpu.cpu_addr_valid)[v]))
+                    ==> tap_addr_perm_v(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == false);
+    ensures (status == enclave_op_success) ==> 
+    (forall (v : vaddr_t) :: 
+        (tap_addr_perm_v(old(cpu.cpu_addr_valid)[v])  &&
+         !(tap_addr_perm_w(old(cpu.cpu_addr_valid)[v])  &&
+           !tap_addr_perm_r(old(cpu.cpu_addr_valid)[v]) &&
+           !tap_addr_perm_x(old(cpu.cpu_addr_valid)[v])))
+        ==> tap_addr_perm_v(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == true);
+    ensures (status == enclave_op_success) ==> 
+    (forall (v : vaddr_t) :: 
+        (!tap_addr_perm_v(old(cpu.cpu_addr_valid)[v]))
+        ==> tap_addr_perm_v(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == false);
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    tap_addr_perm_a(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == 
+                    tap_addr_perm_a(old(cpu.cpu_addr_valid)[v]));
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    tap_addr_perm_p(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == 
+                    tap_addr_perm_p(old(cpu.cpu_addr_valid)[v]));
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    tap_addr_perm_r(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == 
+                    tap_addr_perm_r(old(cpu.cpu_addr_valid)[v]));
+    ensures (status == enclave_op_success) ==> 
+                (forall (v : vaddr_t) :: 
+                    tap_addr_perm_x(tap_enclave_metadata_addr_valid[old(cpu.cpu_enclave_id)][v]) == 
+                    tap_addr_perm_x(old(cpu.cpu_addr_valid)[v]));
+
+    ensures (status == enclave_op_success) ==> cpu.cpu_enclave_id == tap_null_enc_id;
+    ensures (status == enclave_op_success) ==> tap_enclave_metadata_pc[old(cpu.cpu_enclave_id)] == old(tap_enclave_metadata_entrypoint)[old(cpu.cpu_enclave_id)];
+    ensures (status == enclave_op_success) ==> tap_enclave_metadata_addr_map[old(cpu.cpu_enclave_id)] == old(cpu.cpu_addr_map);
+
+    ensures (status == enclave_op_success) ==> (cpu.cpu_pc == old(untrusted_pc));
+    ensures (status == enclave_op_success) ==> (!tap_enclave_metadata_paused[old(cpu.cpu_enclave_id)]);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_regs == untrusted_regs);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_valid == untrusted_addr_valid);
+    ensures (status == enclave_op_success) ==> (cpu.cpu_addr_map == untrusted_addr_map);
+    ensures (tap_addr_perm_x(untrusted_addr_valid[untrusted_pc])
+              ==> (status == enclave_op_success 
+                    ==> tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc])));
+    ensures (status == enclave_op_success
+              ==> (cpu.cpu_owner_map[untrusted_addr_map[untrusted_pc]]
+                    == cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]]));
+
+	modifies tap_enclave_metadata_addr_map;
+	modifies tap_enclave_metadata_paused;
+	modifies tap_enclave_metadata_pc;
+	modifies tap_enclave_metadata_is_snapshot;
+	modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_postinit_measurement;
+	modifies cpu;
+
+{
+    status = enclave_op_success;
+
+    if (!valid_enclave_id(cpu.cpu_enclave_id) || tap_enclave_metadata_is_snapshot[cpu.cpu_enclave_id] == true) {
+        status = enclave_op_failed;
+    } else  {
+        // Set all vaddrs to read-only (since this is called by the currently executing enclave
+        // we must make sure to change the addr_perm mapping on the CPU)
+        var va: vaddr_t;
+	    var t: measurement_t;
+        var exit_status: enclave_op_result_t;
+        var modified_cpu_addr_valid: addr_valid_t;
+
+
+        va = k0_vaddr_t;
+        while (LT_va(va, kmax_vaddr_t)) 
+            invariant (forall (v : vaddr_t) :: 
+                        (LT_va(v, va) ==> tap_addr_perm_w(cpu.cpu_addr_valid[v]) == false));
+            invariant (forall (v : vaddr_t) :: 
+                        (LT_va(v, va) ==> (tap_addr_perm_r(old(cpu.cpu_addr_valid)[v]) == true 
+                                            <==> tap_addr_perm_r(cpu.cpu_addr_valid[v]) == true)));
+            invariant (forall (v : vaddr_t) :: 
+                        (LT_va(v, va) ==> (tap_addr_perm_x(old(cpu.cpu_addr_valid)[v]) == true 
+                                            <==> tap_addr_perm_x(cpu.cpu_addr_valid[v]) == true)));
+
+
+        {
+            call cpu.update_cpu_addr_valid(va, tap_unset_addr_perm_w(cpu.cpu_addr_valid[va]));
+            va = PLUS_va(va, k1_vaddr_t);
+        }
+
+        
+        call cpu.update_cpu_addr_valid(va, tap_unset_addr_perm_w(cpu.cpu_addr_valid[va]));
+
+        
+
+        tap_enclave_metadata_postinit_measurement[cpu.cpu_enclave_id] = t;
+        tap_enclave_metadata_is_snapshot[cpu.cpu_enclave_id] = true;
+
+        call (exit_status) = exit();
+        assert exit_status == enclave_op_success;
+        assert exit_status == status;
+    }
+}
+
+// Create a new child enclave for an uncreated enclave ID
+// Set child permissions for parent mem to RX
+// Clone should look similar to launch, re-use snapshot metatdata 
+
+procedure [noinline] clone(
+    eid   : tap_enclave_id_t, 
+    parent_eid  : tap_enclave_id_t,
+    excl_paddr  : excl_map_t,
+    bounds      : bounds_t
+)
+    returns (status : enclave_op_result_t)
+
+    //
+    // global TAP invariants
+    //
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==>
+                    (cpu.cpu_owner_map[pa] != e));
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==>
+                    (cpu.cpu_owner_map[pa] != e));
+
+
+    // Keep free pool consistent
+    requires (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != eid) ==>
+              tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+
+    requires (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    requires (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+
+    ensures (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    requires (forall (p_e : tap_enclave_id_t, e : tap_enclave_id_t) :: 
+        (p_e != tap_invalid_enc_id && !tap_enclave_metadata_valid[p_e] ==> tap_enclave_metadata_parent[e] != p_e));
+    ensures (forall (p_e : tap_enclave_id_t, e : tap_enclave_id_t) :: 
+        (p_e != tap_invalid_enc_id && !tap_enclave_metadata_valid[p_e] ==> tap_enclave_metadata_parent[e] != p_e));
+
+
+
+
+
+
+
+
+    // Additional preconditions on parent enclave
+    //requires taptap_enclave_metadata
+
+    // Success/failure conditions
+    ensures (status == enclave_op_success || status == enclave_op_invalid_arg);
+    ensures (old(cpu.cpu_enclave_id) == tap_null_enc_id &&
+             valid_enclave_id(eid) &&
+             !old(tap_enclave_metadata_valid)[eid] &&
+             valid_enclave_id(parent_eid) && 
+             tap_enclave_metadata_valid[parent_eid] &&
+             tap_enclave_metadata_is_snapshot[parent_eid] &&
+             valid_bounds(bounds) &&
+             (forall (p : wap_addr_t) :: in_bounds(p, bounds) <==> excl_paddr[p] == true) &&
+             (forall (p : wap_addr_t) :: (excl_paddr[p] ==> old(cpu.cpu_owner_map)[p] == tap_null_enc_id)) &&
+             LT_wapa(k0_wap_addr_t, sizeof_bounds(bounds)))
+            <==> (status == enclave_op_success);
+
+
+    //these postconditions say that nothing change if status != success
+  
+    ensures (status != enclave_op_success ==> cpu.cpu_owner_map == old(cpu.cpu_owner_map));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_valid == old(tap_enclave_metadata_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_map == old(tap_enclave_metadata_addr_map));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_valid == old(tap_enclave_metadata_addr_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_addr_excl == old(tap_enclave_metadata_addr_excl));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_entrypoint == old(tap_enclave_metadata_entrypoint));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_pc == old(tap_enclave_metadata_pc));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_regs == old(tap_enclave_metadata_regs));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_paused == old(tap_enclave_metadata_paused));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_cache_conflict == old(tap_enclave_metadata_cache_conflict));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_parent == old(tap_enclave_metadata_parent));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_child_count == old(tap_enclave_metadata_child_count));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_wap_addr_free == old(tap_enclave_metadata_wap_addr_free));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_is_snapshot == old(tap_enclave_metadata_is_snapshot));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_bounds_valid == old(tap_enclave_metadata_bounds_valid));
+    ensures (status != enclave_op_success ==> tap_enclave_metadata_region_bounds == old(tap_enclave_metadata_region_bounds));
+
+
+
+
+
+
+    //these postconditions say that only entry [eid] changes in the maps
+  
+    ensures (forall (pa : wap_addr_t) ::
+              (status == enclave_op_success) ==>
+                (excl_paddr[pa] <==> cpu.cpu_owner_map[pa] == eid));
+    ensures (forall (pa : wap_addr_t) ::
+              status == enclave_op_success ==> 
+              (!excl_paddr[pa] ==> cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+    ensures (forall (pa : wap_addr_t) ::
+              status != enclave_op_success ==>
+                (cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==> 
+                tap_enclave_metadata_valid[e] == old(tap_enclave_metadata_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_addr_valid[e] == old(tap_enclave_metadata_addr_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_addr_excl[e] == old(tap_enclave_metadata_addr_excl)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==> 
+                tap_enclave_metadata_addr_map[e] == old(tap_enclave_metadata_addr_map)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_pc[e] == old(tap_enclave_metadata_pc)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_entrypoint[e] == old(tap_enclave_metadata_entrypoint)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_regs[e] == old(tap_enclave_metadata_regs)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_paused[e] == old(tap_enclave_metadata_paused)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_cache_conflict[e] == old(tap_enclave_metadata_cache_conflict)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_parent[e] == old(tap_enclave_metadata_parent)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != parent_eid && e != eid) ==>
+                tap_enclave_metadata_child_count[e] == old(tap_enclave_metadata_child_count)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid && e != tap_null_enc_id) ==>
+                tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_is_snapshot[e] == old(tap_enclave_metadata_is_snapshot)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_bounds_valid[e] == old(tap_enclave_metadata_bounds_valid)[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+              (e != eid) ==>
+                tap_enclave_metadata_region_bounds[e] == old(tap_enclave_metadata_region_bounds)[e]);
+
+
+
+
+    
+    //
+    // specify what changes when we succeed
+    //
+    ensures (status == enclave_op_success ==> (forall (pa : wap_addr_t) ::
+              (if (excl_paddr[pa]) then cpu.cpu_owner_map[pa] == eid
+                                 else cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa])));
+    ensures (status == enclave_op_success) ==> (forall (pa : wap_addr_t) ::
+              if (excl_paddr[pa]) then cpu.cpu_owner_map[pa] == eid
+                                else cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]);
+    ensures (status == enclave_op_success) ==> (tap_enclave_metadata_valid[eid]);
+    ensures (status == enclave_op_success) ==> (tap_enclave_metadata_pc[eid] == tap_enclave_metadata_pc[parent_eid]);
+    ensures (status == enclave_op_success) ==> (tap_enclave_metadata_entrypoint[eid] == tap_enclave_metadata_entrypoint[parent_eid]);
+    ensures (status == enclave_op_success) ==> (!tap_enclave_metadata_paused[eid]);
+    ensures (status == enclave_op_success) ==> (
+              (exists (p1, p2 : wap_addr_t) :: cpu.cpu_owner_map[p1] == eid &&
+                                               cpu.cpu_owner_map[p2] != eid &&
+                                               paddr2set(p1) == paddr2set(p2)) 
+              <==> tap_enclave_metadata_cache_conflict[eid]);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_regs[eid] == tap_enclave_metadata_regs[parent_eid]);
+    ensures (status == enclave_op_success) ==> 
+              (tap_enclave_metadata_addr_valid[eid] == tap_enclave_metadata_addr_valid[parent_eid]);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_excl[eid] == tap_enclave_metadata_addr_excl[parent_eid]);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_addr_map[eid] == tap_enclave_metadata_addr_map[parent_eid]);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_bounds_valid[eid] == true);
+    ensures (status == enclave_op_success) ==>
+              (tap_enclave_metadata_region_bounds[eid] == bounds);
+    ensures (status == enclave_op_success) ==>
+                tap_enclave_metadata_is_snapshot[eid] == false;
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_parent[eid] == parent_eid);
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_child_count[parent_eid] == old(tap_enclave_metadata_child_count)[parent_eid] + 1);
+    ensures (status == enclave_op_success) ==>
+                (tap_enclave_metadata_child_count[eid] == 0);
+
+    ////// additional invariants that hold upon success
+    //ensures (status == enclave_op_success) ==>
+    //          (forall (v1, v2 : vaddr_t) ::
+    //            !vaddr_alias(tap_enclave_metadata_addr_excl[eid],
+    //                         tap_enclave_metadata_addr_map[eid], v1, v2));
+    //ensures (status == enclave_op_success) ==>
+    //          (forall (v : vaddr_t) ::
+    //            (tap_enclave_metadata_addr_excl[eid])[v] ==>
+    //            (cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[eid])[v]] == eid ||
+    //             cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[eid])[v]] == parent_eid));
+    //ensures (status == enclave_op_success) ==>
+    //          (forall (v : vaddr_t) ::
+    //            (tap_enclave_metadata_addr_excl[eid])[v] ==>
+    //            tap_addr_perm_v((tap_enclave_metadata_addr_valid[eid])[v]));
+    ensures (status == enclave_op_success) ==>
+      (forall (p : wap_addr_t) ::
+          (!in_bounds(p, bounds) ==> tap_enclave_metadata_wap_addr_free[eid][p] == false));
+    ensures (status == enclave_op_success) ==>
+          (forall (p : wap_addr_t, v : vaddr_t) ::
+              (in_bounds(p, bounds) ==> tap_enclave_metadata_wap_addr_free[eid][p] == true));
+    //ensures (status == enclave_op_success) ==>
+    //  (forall (p : wap_addr_t, v : vaddr_t) ::
+    //      (in_bounds(p, bounds) && (exists (v : vaddr_t) :: tap_enclave_metadata_addr_map[eid][v] == p)) ==>  
+    //        (tap_enclave_metadata_wap_addr_free[eid][p] == false));
+
+
+    requires tap_enclave_metadata_parent[tap_null_enc_id] == tap_invalid_enc_id;
+    ensures tap_enclave_metadata_parent[tap_null_enc_id] == tap_invalid_enc_id;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_excl;
+    modifies tap_enclave_metadata_entrypoint;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_cache_conflict;
+    modifies tap_enclave_metadata_parent;
+    modifies tap_enclave_metadata_child_count;
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies tap_enclave_metadata_bounds_valid;
+    modifies tap_enclave_metadata_region_bounds;
+    modifies cpu;
+{
+    
+    var i, k             : integer;
+    var mappings_alias_v : boolean;
+    var paddr            : wap_addr_t;
+    var va               : vaddr_t;
+
+    status = enclave_op_success;
+    
+    // ensure cpu mode is valid
+    if (cpu.cpu_enclave_id != tap_null_enc_id) { 
+       status = enclave_op_invalid_arg; 
+    }
+
+    // ensure eid is valid
+    if (status != enclave_op_invalid_arg && !valid_enclave_id(eid)) {
+       status = enclave_op_invalid_arg; 
+    }
+
+    assert (status == enclave_op_success ==> valid_enclave_id(eid));
+
+    if (status != enclave_op_invalid_arg && tap_enclave_metadata_valid[eid]) {
+       status = enclave_op_invalid_arg; 
+    }
+
+
+
+    // ensure parent_eid is valid 
+    // parent enclave's metadata must exist and parent must be a snapshot
+    if  (status != enclave_op_invalid_arg &&
+        (!valid_enclave_id(parent_eid) || 
+         !tap_enclave_metadata_valid[parent_eid] || 
+         !tap_enclave_metadata_is_snapshot[parent_eid]))
+    {
+        status = enclave_op_invalid_arg;
+    } 
+
+
+    // Check that bounds are valid
+    if (status != enclave_op_invalid_arg && !valid_bounds(bounds)) {
+        status = enclave_op_invalid_arg;
+    } 
+
+    assert (status == enclave_op_success ==> valid_enclave_id(eid));
+
+
+    {
+        // Check that excl_paddr respects the bounds
+        var paddr: wap_addr_t;
+
+        paddr = k0_wap_addr_t;
+        while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg) 
+            invariant (status != enclave_op_invalid_arg) ==>
+                (forall (p : wap_addr_t) :: LT_wapa(p, paddr) ==> 
+                    (in_bounds(p, bounds) <==> excl_paddr[p] == true));
+            invariant LTE_wapa(paddr, kmax_wap_addr_t);
+            invariant (status == enclave_op_success || status == enclave_op_invalid_arg);
+        {
+            if ((!in_bounds(paddr, bounds) && excl_paddr[paddr] == true) || 
+                (in_bounds(paddr, bounds) && excl_paddr[paddr] == false)) 
+            {
+                status = enclave_op_invalid_arg;
+            }
+            paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+        }
+        
+        assert(status != enclave_op_invalid_arg ==> paddr == kmax_wap_addr_t);
+
+        if (status != enclave_op_invalid_arg &&
+            ((!in_bounds(paddr, bounds) && excl_paddr[paddr] == true) || 
+                (in_bounds(paddr, bounds) && excl_paddr[paddr] == false)))
+        {
+            status = enclave_op_invalid_arg;
+        }
+    }
+
+
+    assert (status == enclave_op_success ==> valid_enclave_id(eid));
+
+
+    // ensure none of the paddrs are already exclusive
+    paddr = k0_wap_addr_t;
+    while (LT_wapa(paddr, kmax_wap_addr_t) && status != enclave_op_invalid_arg)
+      invariant ((status != enclave_op_invalid_arg) ==>
+        (forall (pa : wap_addr_t) ::
+          ((LT_wapa(pa, paddr) && excl_paddr[pa]) ==>
+            cpu.cpu_owner_map[pa] == tap_null_enc_id)));
+      invariant ((status != enclave_op_invalid_arg) ==>
+        (forall (pa : wap_addr_t) ::
+          (LT_wapa(pa, paddr) ==> cpu.cpu_owner_map[pa] != eid)));
+      invariant(status == enclave_op_success || status == enclave_op_invalid_arg);
+    {
+      if (excl_paddr[paddr]) {
+        if (cpu.cpu_owner_map[paddr] != tap_null_enc_id) {
+          status = enclave_op_invalid_arg;
+        }
+      }
+      if (cpu.cpu_owner_map[paddr] == eid) {
+        status = enclave_op_invalid_arg;
+      }
+      paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+    }
+
+    assert(status != enclave_op_invalid_arg ==> paddr == kmax_wap_addr_t);
+
+    if (status != enclave_op_invalid_arg) {
+        if (excl_paddr[paddr]) {
+            if (cpu.cpu_owner_map[paddr] != tap_null_enc_id) {
+              status = enclave_op_invalid_arg;
+            }
+        }
+
+        if (cpu.cpu_owner_map[paddr] == eid) {
+            status = enclave_op_invalid_arg;
+        }
+    }
+
+    
+
+    // Check that sizes of the new enclave are valid
+    if (status != enclave_op_invalid_arg) {
+        var child_size: wap_addr_t;
+        var parent_size: wap_addr_t;
+
+        child_size = sizeof_bounds(bounds);
+
+        if (child_size == k0_wap_addr_t) {
+            status = enclave_op_invalid_arg;
+        } 
+    }
+
+    assert(status == enclave_op_success || status == enclave_op_invalid_arg);
+
+
+
+    // Place all checks above
+    if (status == enclave_op_success) {
+        var paddr: wap_addr_t;
+        var free_wap_addrs: [wap_addr_t]boolean;
+        var va: vaddr_t;
+        var child_addr_valid: [vaddr_t]addr_perm_t;
+        var cache_conflict: boolean;
+
+        assert (eid != tap_null_enc_id);
+        assert (valid_enclave_id(eid));
+
+
+        assume (forall (w: wap_addr_t) :: free_wap_addrs[w] == false);
+
+        tap_enclave_metadata_valid[eid]           = true;
+        tap_enclave_metadata_pc[eid]              = tap_enclave_metadata_pc[parent_eid];
+        tap_enclave_metadata_regs[eid]            = tap_enclave_metadata_regs[parent_eid];
+        tap_enclave_metadata_paused[eid]          = false;
+        tap_enclave_metadata_addr_map[eid]        = tap_enclave_metadata_addr_map[parent_eid];
+        tap_enclave_metadata_addr_valid[eid]      = tap_enclave_metadata_addr_valid[parent_eid];
+        tap_enclave_metadata_addr_excl[eid]       = tap_enclave_metadata_addr_excl[parent_eid];
+        tap_enclave_metadata_entrypoint[eid]      = tap_enclave_metadata_entrypoint[parent_eid];
+        tap_enclave_metadata_wap_addr_free[eid]   = free_wap_addrs;
+        tap_enclave_metadata_is_snapshot[eid]     = false;
+        tap_enclave_metadata_region_bounds[eid]   = bounds;
+        tap_enclave_metadata_bounds_valid[eid]    = true;
+        tap_enclave_metadata_child_count[eid]     = 0;
+
+
+        // Set the CPU owner map.
+        paddr = k0_wap_addr_t;
+        while (LT_wapa(paddr, kmax_wap_addr_t))
+          invariant (forall (pa : wap_addr_t) ::
+                      (LT_wapa(pa, paddr) && excl_paddr[pa]) ==>
+                        cpu.cpu_owner_map[pa] == eid);
+          invariant (forall (pa : wap_addr_t) ::
+                      (LT_wapa(pa, paddr) && !excl_paddr[pa]) ==>
+                        cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]);
+          invariant (forall (pa : wap_addr_t) ::
+                      !LT_wapa (pa, paddr) ==> cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]);
+          invariant (forall (e : tap_enclave_id_t, pa : wap_addr_t) ::
+                      (e != eid && e != tap_null_enc_id) ==>
+                        (cpu.cpu_owner_map[pa] == e) ==> (cpu.cpu_owner_map[pa] == old(cpu.cpu_owner_map)[pa]));
+          invariant LTE_wapa(paddr, kmax_wap_addr_t);
+          invariant (forall (e : tap_enclave_id_t) :: (e != tap_null_enc_id && e != eid) ==>
+              tap_enclave_metadata_wap_addr_free[e] == old(tap_enclave_metadata_wap_addr_free)[e]);
+          invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+     
+          invariant (forall (p : wap_addr_t, v : vaddr_t) ::
+              (LT_wapa(p, paddr) && in_bounds(p, bounds) ==> tap_enclave_metadata_wap_addr_free[eid][p] == true));
+        {
+          if (excl_paddr[paddr]) { 
+            var null_wap_free: [wap_addr_t]boolean;
+            var enc_wap_free: [wap_addr_t]boolean;
+
+            call cpu.update_cpu_owner_map(paddr, eid); 
+
+            null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+            null_wap_free[paddr] = false;
+            tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+
+            // Update free lists for enclaves, at this step we assume all physical addrs are free
+            // This is not generally true when we clone from another enclave (not snapshot)
+            enc_wap_free = tap_enclave_metadata_wap_addr_free[eid];
+            enc_wap_free[paddr] = true;
+            tap_enclave_metadata_wap_addr_free[eid] = enc_wap_free;
+          }
+          paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+        }
+
+        assert(paddr == kmax_wap_addr_t);
+
+        if (excl_paddr[paddr]) { 
+          var null_wap_free: [wap_addr_t]boolean;
+          var enc_wap_free: [wap_addr_t]boolean;
+
+          call cpu.update_cpu_owner_map(paddr, eid); 
+
+          null_wap_free = tap_enclave_metadata_wap_addr_free[tap_null_enc_id];
+          null_wap_free[paddr] = false;
+          tap_enclave_metadata_wap_addr_free[tap_null_enc_id] = null_wap_free;
+
+
+          // Update free lists for enclaves, at this step we assume all physical addrs are free
+          // This is not generally true when we clone from another enclave (not snapshot)
+          enc_wap_free = tap_enclave_metadata_wap_addr_free[eid];
+          enc_wap_free[paddr] = true;
+          tap_enclave_metadata_wap_addr_free[eid] = enc_wap_free;
+        }
+        paddr = PLUS_wapa(paddr, k1_wap_addr_t);
+
+
+        // Check for cache conflict after updating state
+        call (cache_conflict) = does_enclave_conflict(eid);
+        tap_enclave_metadata_cache_conflict[eid]  = cache_conflict;
+
+        
+        // FAAS metadata
+	    tap_enclave_metadata_parent[eid] = parent_eid;
+	    tap_enclave_metadata_child_count[parent_eid] = tap_enclave_metadata_child_count[parent_eid]+1;
+    }
+}
+
+
+
+
+
+//
+// Proof support
+// 
+
+//NOTE: Everything below this line is implemented to allow for proofs to function 
+//      using instantiations of the cpu module.
+
+
+//
+// Common Procedures found in ImplCommon.bpl
+//
+procedure tap_addr_valid_proofs()
+{
+    // setting the present bit does not affect the axrw bits.
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_p(p)));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_a(tap_set_addr_perm_p(p)) == tap_addr_perm_a(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_x(tap_set_addr_perm_p(p)) == tap_addr_perm_x(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_r(tap_set_addr_perm_p(p)) == tap_addr_perm_r(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_w(tap_set_addr_perm_p(p)) == tap_addr_perm_w(p));
+    // setting the a bit does not affect the pxrw bits.
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_a(tap_set_addr_perm_a(p)));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_a(p)) == tap_addr_perm_p(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_x(tap_set_addr_perm_a(p)) == tap_addr_perm_x(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_r(tap_set_addr_perm_a(p)) == tap_addr_perm_r(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_w(tap_set_addr_perm_a(p)) == tap_addr_perm_w(p));
+    // setting the x bit does not affect parw.
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_x(tap_set_addr_perm_x(p)));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_x(p)) == tap_addr_perm_p(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_a(tap_set_addr_perm_x(p)) == tap_addr_perm_a(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_r(tap_set_addr_perm_x(p)) == tap_addr_perm_r(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_w(tap_set_addr_perm_x(p)) == tap_addr_perm_w(p));
+    // setting the r bit does not affect paxw.
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_r(tap_set_addr_perm_r(p)));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_r(p)) == tap_addr_perm_p(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_a(tap_set_addr_perm_x(p)) == tap_addr_perm_a(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_x(tap_set_addr_perm_r(p)) == tap_addr_perm_x(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_w(tap_set_addr_perm_r(p)) == tap_addr_perm_w(p));
+    // setting the w bit does not affect pax:.
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_w(tap_set_addr_perm_w(p)));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_p(tap_set_addr_perm_w(p)) == tap_addr_perm_p(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_a(tap_set_addr_perm_w(p)) == tap_addr_perm_a(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_x(tap_set_addr_perm_w(p)) == tap_addr_perm_x(p));
+    assert (forall (p : addr_perm_t) :: tap_addr_perm_r(tap_set_addr_perm_w(p)) == tap_addr_perm_r(p));
+    // tap_addr_perm_eq
+    assert (forall (p1, p2 : addr_perm_t) :: (tap_addr_perm_eq(p1, p2)) <==>
+                                           (tap_addr_perm_bits(p1) == tap_addr_perm_bits(p2)));
+}
+
+procedure InitialHavoc()
+    returns (current_mode : mode_t)
+    ensures (current_mode == mode_untrusted);
+    //----------------------------------------------------------------------//
+    // global TAP invariants.                                               //
+    //----------------------------------------------------------------------//
+    ensures (cpu.cpu_enclave_id == tap_null_enc_id);
+    ensures  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                    (cpu.cpu_owner_map[pa] != e));
+    // Keep free pool consistent
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+    ensures (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    ensures (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+    ensures (forall (e :tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (p_e : tap_enclave_id_t, e : tap_enclave_id_t) :: 
+        (p_e != tap_invalid_enc_id && !tap_enclave_metadata_valid[p_e] ==> tap_enclave_metadata_parent[e] != p_e));
+
+
+
+
+
+
+    // current pc invariants
+    ensures (tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]));
+    ensures (cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id);
+    // enclave invariants.
+    ensures (forall (e : tap_enclave_id_t) :: !valid_enclave_id(e) ==> !tap_enclave_metadata_valid[e]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    tap_addr_perm_x((tap_enclave_metadata_addr_valid[e])[tap_enclave_metadata_pc[e]]));
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    tap_addr_perm_x((tap_enclave_metadata_addr_valid[e])[tap_enclave_metadata_entrypoint[e]]));
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    (tap_enclave_metadata_addr_excl[e])[tap_enclave_metadata_pc[e]]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    (tap_enclave_metadata_addr_excl[e])[tap_enclave_metadata_entrypoint[e]]);
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[e])[tap_enclave_metadata_pc[e]]] == e);
+    ensures (forall (e : tap_enclave_id_t) ::
+                tap_enclave_metadata_valid[e] ==> 
+                    cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[e])[tap_enclave_metadata_entrypoint[e]]] == e);
+    // CPU/Enclave address map invariants.
+    ensures (forall (va : vaddr_t) :: 
+                (cpu.cpu_enclave_id == tap_null_enc_id) ==> 
+                    (cpu.cpu_addr_map[va] == untrusted_addr_map[va]));
+    ensures (forall (va : vaddr_t) :: 
+                (cpu.cpu_enclave_id == tap_null_enc_id) ==> 
+                    tap_addr_perm_eq(cpu.cpu_addr_valid[va], untrusted_addr_valid[va]));
+    ensures (forall (va : vaddr_t) :: 
+                (cpu.cpu_enclave_id != tap_null_enc_id) ==> 
+                    (cpu.cpu_addr_map[va] == (tap_enclave_metadata_addr_map[cpu.cpu_enclave_id])[va]));
+    ensures (forall (va : vaddr_t) :: 
+                (cpu.cpu_enclave_id != tap_null_enc_id) ==> 
+                    tap_addr_perm_eq(cpu.cpu_addr_valid[va], (tap_enclave_metadata_addr_valid[cpu.cpu_enclave_id])[va]));
+    // FAAS TAP invariants
+    ensures tap_enclave_metadata_parent[tap_null_enc_id] == tap_invalid_enc_id;
+    modifies cpu;
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_regs;
+    modifies untrusted_pc;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_excl;
+    modifies tap_enclave_metadata_entrypoint;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_cache_conflict;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies tap_enclave_metadata_parent;
+    modifies tap_enclave_metadata_child_count;
+    modifies tap_enclave_metadata_postinit_measurement;
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies tap_enclave_metadata_bounds_valid;
+    modifies tap_enclave_metadata_region_bounds;
+{
+    var status            : enclave_op_result_t;
+    var r_eid, r_parent_eid : tap_enclave_id_t;
+    var r_addr_valid      : addr_valid_t;
+    var r_addr_map        : addr_map_t;
+    var r_addr_excl       : excl_vaddr_t;
+    var r_excl_map        : excl_map_t;
+    var r_bounds          : bounds_t;
+    var r_container_valid : container_valid_t;
+    var r_container_data  : container_data_t;
+    var r_entrypoint      : vaddr_t;
+    var r_vaddr           : vaddr_t;
+    var r_paddr           : wap_addr_t;
+    var r_word            : word_t;
+    var r_valid           : addr_perm_t;
+    var r_excp            : exception_t;
+    var repl_way          : cache_way_index_t;
+    var done              : boolean;
+    var hit               : boolean;
+
+    
+    call initialize_tap();
+
+    assert (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+    assert (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+
+
+    current_mode = mode_untrusted;
+    // and loop will run for a few iterations.
+    done = false;
+
+
+
+    while (!done)
+        invariant (forall (e :tap_enclave_id_t) :: tap_enclave_metadata_child_count[e] >= 0);
+        invariant (forall (e : tap_enclave_id_t) ::
+                (tap_enclave_metadata_parent[e] != tap_invalid_enc_id) ==>
+                (tap_enclave_metadata_child_count[tap_enclave_metadata_parent[e]] > 0));
+        invariant (forall (e :tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+        invariant (forall (p_e : tap_enclave_id_t, e : tap_enclave_id_t) :: 
+            (p_e != tap_invalid_enc_id && !tap_enclave_metadata_valid[p_e] ==> tap_enclave_metadata_parent[e] != p_e));
+
+
+
+
+        // CPU invariants.
+        invariant (done ==> (cpu.cpu_enclave_id == tap_null_enc_id));
+
+        // current pc invariants
+        invariant (tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]));
+        invariant (tap_addr_perm_x(untrusted_addr_valid[untrusted_pc]));
+        invariant (cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id);
+        invariant (valid_enclave_id(cpu.cpu_enclave_id) || cpu.cpu_enclave_id == tap_null_enc_id);
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==> ((tap_enclave_metadata_addr_excl[cpu.cpu_enclave_id])[cpu.cpu_pc]);
+        //// OS invariants.
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==> (tap_addr_perm_x(untrusted_addr_valid[untrusted_pc]));
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==> (cpu.cpu_owner_map[untrusted_addr_map[untrusted_pc]] == tap_null_enc_id);
+        // CPU/enclave invariants.
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)==> tap_enclave_metadata_valid[cpu.cpu_enclave_id]);
+        invariant (cpu.cpu_enclave_id != tap_blocked_enc_id);
+        // enclave invariants.
+        invariant (forall (e : tap_enclave_id_t) ::
+                    !valid_enclave_id(e) ==> !tap_enclave_metadata_valid[e]);
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==> 
+                    tap_addr_perm_x((tap_enclave_metadata_addr_valid[cpu.cpu_enclave_id])[cpu.cpu_pc]);
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==> 
+                    cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[cpu.cpu_enclave_id])[cpu.cpu_pc]] == cpu.cpu_enclave_id;
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==>
+                    tap_addr_perm_x(
+                        (tap_enclave_metadata_addr_valid[cpu.cpu_enclave_id])[tap_enclave_metadata_entrypoint[cpu.cpu_enclave_id]]);
+        invariant (valid_enclave_id(cpu.cpu_enclave_id)) ==>
+                    cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[cpu.cpu_enclave_id])[tap_enclave_metadata_entrypoint[cpu.cpu_enclave_id]]] == cpu.cpu_enclave_id;
+        invariant (forall (e : tap_enclave_id_t) ::
+                    tap_enclave_metadata_valid[e] ==> 
+                        tap_addr_perm_x((tap_enclave_metadata_addr_valid[e])[tap_enclave_metadata_pc[e]]));
+        invariant (forall (e : tap_enclave_id_t) ::
+            tap_enclave_metadata_valid[e] ==>
+              tap_addr_perm_x((tap_enclave_metadata_addr_valid[e])[tap_enclave_metadata_entrypoint[e]]));
+
+        invariant (forall (e : tap_enclave_id_t, v : vaddr_t) ::
+                    (tap_enclave_metadata_valid[e] && (tap_enclave_metadata_addr_excl[e])[v]) ==> 
+                            tap_addr_perm_v((tap_enclave_metadata_addr_valid[e])[v]));
+        invariant (forall (e : tap_enclave_id_t, v : vaddr_t) ::
+                    (tap_enclave_metadata_valid[e] && (tap_enclave_metadata_addr_excl[e])[v]) ==> 
+                            (cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[e])[v]] == e));
+        invariant (forall (e : tap_enclave_id_t) ::
+                    tap_enclave_metadata_valid[e] ==> 
+                        (tap_enclave_metadata_addr_excl[e])[tap_enclave_metadata_pc[e]]);
+        invariant (forall (e : tap_enclave_id_t) ::
+                    tap_enclave_metadata_valid[e] ==> 
+                        (tap_enclave_metadata_addr_excl[e])[tap_enclave_metadata_entrypoint[e]]);
+        invariant (forall (e : tap_enclave_id_t) ::
+                    tap_enclave_metadata_valid[e] ==> 
+                        cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[e])[tap_enclave_metadata_pc[e]]] == e);
+        invariant (forall (e : tap_enclave_id_t) ::
+                    tap_enclave_metadata_valid[e] ==> 
+                        cpu.cpu_owner_map[(tap_enclave_metadata_addr_map[e])[tap_enclave_metadata_entrypoint[e]]] == e);
+        // CPU/Enclave address map invariants.
+        invariant (forall (va : vaddr_t) :: 
+                    (cpu.cpu_enclave_id == tap_null_enc_id) ==> 
+                        (cpu.cpu_addr_map[va] == untrusted_addr_map[va]));
+        invariant (forall (va : vaddr_t) :: 
+                    (cpu.cpu_enclave_id == tap_null_enc_id) ==> 
+                        tap_addr_perm_eq(cpu.cpu_addr_valid[va], untrusted_addr_valid[va]));
+        invariant (forall (va : vaddr_t) :: 
+                    (cpu.cpu_enclave_id != tap_null_enc_id) ==> 
+                        (cpu.cpu_addr_map[va] == (tap_enclave_metadata_addr_map[cpu.cpu_enclave_id])[va]));
+        invariant (forall (va : vaddr_t) :: 
+                    (cpu.cpu_enclave_id != tap_null_enc_id) ==> 
+                        tap_addr_perm_eq(cpu.cpu_addr_valid[va], (tap_enclave_metadata_addr_valid[cpu.cpu_enclave_id])[va]));
+        invariant  (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+                    (valid_enclave_id(e) && !tap_enclave_metadata_valid[e]) ==> 
+                        (cpu.cpu_owner_map[pa] != e));
+
+        // FAAS TAP invariants
+        invariant tap_enclave_metadata_parent[tap_null_enc_id] == tap_invalid_enc_id;
+        invariant (forall (pa : wap_addr_t, e : tap_enclave_id_t) :: 
+                    tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+        
+   {
+        havoc r_eid;
+        if (*) {
+            havoc r_parent_eid;
+            havoc r_excl_map;
+            havoc r_bounds;
+            call (status) = clone(r_eid, r_parent_eid, r_excl_map, r_bounds);
+        } else {
+            if (*) {
+                havoc r_addr_valid;
+                havoc r_addr_map;
+                havoc r_excl_map;
+                havoc r_container_valid;
+                havoc r_container_data;
+                havoc r_entrypoint;
+                assume !r_excl_map[cpu.cpu_addr_map[cpu.cpu_pc]];
+                call InitOSMem(r_container_valid, r_container_data);
+                call (status) = launch(r_eid, r_addr_valid, r_addr_map, r_addr_excl, r_excl_map, r_bounds, r_entrypoint);
+            } else {
+		      if (*) {
+		        call (status) = snapshot();
+		    } else {
+              if (*) {
+                call (status) = enter(r_eid);
+              } else {
+                if (*) {
+                  call (status) = exit();
+                } else {
+                  if (*) {
+                    call (status) = resume(r_eid);
+                  } else {
+                    if (*) {
+                      call (status) = pause();
+                    } else {
+                      if (*) {
+                        call (status) = destroy(r_eid);
+                      } else {
+                        if (*) {
+                          havoc r_vaddr;
+                          havoc r_word;
+                          havoc repl_way;
+                          assume valid_cache_way_index(repl_way);
+                          call (r_excp, hit) = cpu.store_va(r_vaddr, r_word, repl_way);
+                        } else {
+                          if (*) {
+                            call cpu.havoc_cpu_pc();
+                            call cpu.havoc_cpu_regs();
+                            assume (tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]));
+                            assume (cpu.cpu_enclave_id != tap_null_enc_id) ==> 
+                              ((tap_enclave_metadata_addr_excl[cpu.cpu_enclave_id])[cpu.cpu_pc]);
+                            assume (cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id);
+                          } else {
+                            if (*) {
+                              if (cpu.cpu_enclave_id == tap_null_enc_id) {
+                              havoc r_valid;
+                              havoc r_vaddr;
+                              havoc r_paddr;
+                              assume r_vaddr != cpu.cpu_pc && r_vaddr != untrusted_pc;
+                              call set_addr_map(r_vaddr, r_paddr, r_valid);
+                              }
+                            } else {
+                              if (cpu.cpu_enclave_id == tap_null_enc_id) {
+                                done = true;
+                                assert cpu.cpu_enclave_id == tap_null_enc_id;
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+		  }
+        }
+    }
+}
+
+procedure [noinline] InitOSMem(container_valid : container_valid_t, container_data : container_data_t)
+    ensures (forall (p : wap_addr_t) ::
+                    if (cpu.cpu_owner_map[p] == tap_null_enc_id && container_valid[p])
+                        then cpu.cpu_mem[p] == container_data[p]
+                        else cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]);
+    modifies cpu;
+{}
+
+procedure HavocOSMem(excl_map : excl_map_t)
+    ensures (forall (p : wap_addr_t) ::
+                    (cpu.cpu_owner_map[p] != tap_null_enc_id || !excl_map[p])
+                        ==> (cpu.cpu_mem[p] == old(cpu.cpu_mem)[p]));
+    modifies cpu;
+{}
+
+procedure InitUntrustedState(_untrusted_addr_valid: addr_valid_t, _untrusted_addr_map: addr_map_t, _untrusted_pc: vaddr_t)
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_pc;
+{
+    untrusted_addr_valid = _untrusted_addr_valid;
+    untrusted_addr_map = _untrusted_addr_map;
+    untrusted_pc = _untrusted_pc;
+}
+  
+
+//--------------------------------------------------------------------------//
+// Utility functions for measurement theorem.                               //
+//--------------------------------------------------------------------------//
+procedure [inline] MeasurementEnclaveComputation(iter : integer)
+    returns (vaddr : vaddr_t, data : word_t)
+
+    modifies cpu;
+
+    requires (tap_enclave_metadata_valid[cpu.cpu_enclave_id]);
+    requires tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+    requires cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id;
+{
+    var r0, r1  : word_t;
+    var rd      : regindex_t;
+    var eid     : tap_enclave_id_t;
+    var pc_pa   : wap_addr_t;
+    var pc_op   : word_t;
+    var l_vaddr : vaddr_t;
+    var l_data  : word_t;
+    var s_vaddr : vaddr_t;
+    var s_data  : word_t;
+    var excp    : exception_t;
+    var hit     : boolean;
+    var way     : cache_way_index_t;
+
+    eid = cpu.cpu_enclave_id;
+    pc_pa = cpu.cpu_addr_map[cpu.cpu_pc];
+    assert (tap_enclave_metadata_addr_excl[eid])[cpu.cpu_pc];
+    assert cpu.cpu_owner_map[pc_pa] == eid;
+    havoc way; 
+    assume valid_cache_way_index(way);
+    call (pc_op, excp, hit) = cpu.fetch_va(cpu.cpu_pc, way);
+    assert excp == excp_none;
+
+    // two register sources.
+    r0 = cpu.cpu_regs[uf_cpu_r0_index(pc_op)];
+    r1 = cpu.cpu_regs[uf_cpu_r1_index(pc_op)];
+
+    // load address and value.
+    l_vaddr = uf_mem_load_vaddr(cpu.cpu_pc, pc_op, r0, r1);
+    assume tap_addr_perm_r(cpu.cpu_addr_valid[l_vaddr]);
+    if((tap_enclave_metadata_addr_excl[eid])[l_vaddr]) {
+        assert cpu.cpu_owner_map[cpu.cpu_addr_map[l_vaddr]] == eid;
+        havoc way; 
+        assume valid_cache_way_index(way);
+        call (l_data, excp, hit) = cpu.load_va(l_vaddr, way);
+    } else {
+        l_data = uf_load_data(l_vaddr, iter);
+        excp = excp_none;
+        hit = false;
+    }
+
+    // get data to store to mem.
+    s_vaddr = uf_mem_store_vaddr(cpu.cpu_pc, pc_op, l_data, r0, r1);
+    s_data = uf_mem_store_data(cpu.cpu_pc, pc_op, l_data, r0, r1);
+    assume tap_addr_perm_w(cpu.cpu_addr_valid[s_vaddr]);
+    // update mem if we are writing to private memory.
+    if ((tap_enclave_metadata_addr_excl[eid])[s_vaddr]) {
+        assert cpu.cpu_owner_map[cpu.cpu_addr_map[s_vaddr]] == eid;
+        havoc way; 
+        assume valid_cache_way_index(way);
+        call (excp, hit) = cpu.store_va(s_vaddr, s_data, way);
+        assert excp == excp_none;
+    }
+    // if we're writing to shared memory, there's no point because
+    // we can't expect the OS to "remember" what we wrote anyway.
+    // but we do check that both enclaves write the same data to 
+    // the same vaddr.
+    vaddr = s_vaddr;
+    data = s_data;
+
+    // update pc.
+    call cpu.set_cpu_pc(uf_cpu_pc(cpu.cpu_pc, pc_op, l_data, r0, r1));
+    assume tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+    assume (tap_enclave_metadata_addr_excl[eid])[cpu.cpu_pc];
+    assert cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == eid;
+    // update regs.
+    rd = uf_cpu_r2_index(pc_op);
+    call cpu.update_cpu_regs(rd, uf_cpu_result(cpu.cpu_pc, pc_op, l_data, r0, r1));
+}
+                      
+define is_measurement_untrusted_op(op : tap_proof_op_t) : boolean
+= op == tap_proof_op_resume || op == tap_proof_op_enter;
+
+
+define is_measurement_enclave_op(op : tap_proof_op_t) : boolean
+= op == tap_proof_op_compute    ||
+  op == tap_proof_op_pause      ||
+  op == tap_proof_op_exit;
+
+
+procedure [inline] MeasurementUntrustedOp(
+    /* operation */ op   : tap_proof_op_t, 
+    /* enclave   */ eid  : tap_enclave_id_t,
+    /* args      */ regs : regs_t
+) 
+  returns (status : enclave_op_result_t, current_mode : mode_t)
+  ensures (current_mode == mode_untrusted ==> cpu.cpu_enclave_id == tap_null_enc_id);
+  modifies untrusted_addr_valid;
+  modifies untrusted_addr_map;
+  modifies untrusted_regs;
+  modifies untrusted_pc;
+  modifies tap_enclave_metadata_valid;
+  modifies tap_enclave_metadata_addr_map;
+  modifies tap_enclave_metadata_addr_valid;
+  modifies tap_enclave_metadata_entrypoint;
+  modifies tap_enclave_metadata_pc;
+  modifies tap_enclave_metadata_regs;
+  modifies tap_enclave_metadata_paused;
+  modifies tap_enclave_metadata_cache_conflict;
+  modifies cpu;
+{
+    assert (is_measurement_untrusted_op(op));
+    status = enclave_op_success;
+    if (op == tap_proof_op_enter) {
+        call cpu.set_cpu_regs(regs);
+        assert(cpu.cpu_enclave_id == tap_null_enc_id);
+        call (status) = enter(eid);
+        assert status == enclave_op_success;
+        current_mode = mode_enclave;
+    } else {
+        if (op == tap_proof_op_resume) {
+          call (status) = resume(eid);
+          if (status == enclave_op_success) {
+              current_mode = mode_enclave;
+          } else {
+              current_mode = mode_untrusted;
+          }
+        }
+    }
+}
+
+procedure [inline] MeasurementEnclaveOp(
+    /* operation */ op   : tap_proof_op_t,
+    /* iteration */ iter : integer
+) 
+  returns (status : enclave_op_result_t, current_mode : mode_t, vaddr : vaddr_t, word : word_t)
+  modifies untrusted_addr_valid;
+  modifies untrusted_addr_map;
+  modifies untrusted_regs;
+  modifies untrusted_pc;
+  modifies tap_enclave_metadata_valid;
+  modifies tap_enclave_metadata_addr_map;
+  modifies tap_enclave_metadata_addr_valid;
+  modifies tap_enclave_metadata_entrypoint;
+  modifies tap_enclave_metadata_pc;
+  modifies tap_enclave_metadata_regs;
+  modifies tap_enclave_metadata_paused;
+  modifies tap_enclave_metadata_cache_conflict;
+  modifies cpu;
+{
+    assert (is_measurement_enclave_op(op));
+    vaddr = k0_vaddr_t;
+    word  = k0_word_t;
+    case 
+      (op == tap_proof_op_compute) : {
+        call (vaddr, word) = MeasurementEnclaveComputation(iter);
+        status = enclave_op_success;
+        current_mode = mode_enclave;
+      } 
+      (op == tap_proof_op_exit) : {
+        call (status) = exit();
+        current_mode = mode_untrusted;
+      } 
+      (op == tap_proof_op_pause) : {
+        call (status) = pause();
+        current_mode = mode_untrusted;
+      }
+    esac
+    assert status == enclave_op_success;
+}
+
+//
+// Utility functions for integrity proofs
+//
+// The computation performed by the enclave.
+procedure [inline] EnclaveComputation(iter : integer)
+    returns (vaddr : vaddr_t, paddr : wap_addr_t, data : word_t)
+
+    requires (tap_enclave_metadata_valid[cpu.cpu_enclave_id]);
+    requires tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+    requires cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id || 
+             cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == tap_enclave_metadata_parent[cpu.cpu_enclave_id];
+
+    modifies cpu;
+{
+    var r0, r1  : word_t;
+    var rd      : regindex_t;
+    var eid     : tap_enclave_id_t;
+    var pc_pa   : wap_addr_t;
+    var pc_op   : word_t;
+    var l_vaddr : vaddr_t;
+    var l_data  : word_t;
+    var s_vaddr : vaddr_t;
+    var s_data  : word_t;
+    var excp    : exception_t;
+    var hit     : boolean;
+    var way     : cache_way_index_t;
+
+    eid = cpu.cpu_enclave_id;
+    pc_pa = cpu.cpu_addr_map[cpu.cpu_pc];
+    assert tap_enclave_metadata_addr_excl[eid][cpu.cpu_pc];
+    assert tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+
+    havoc way; 
+    assume valid_cache_way_index(way);
+
+    call (pc_op, excp, hit) = cpu.fetch_va(cpu.cpu_pc, way);
+    assert excp == excp_none;
+
+    // two register sources.
+    r0 = cpu.cpu_regs[uf_cpu_r0_index(pc_op)];
+    r1 = cpu.cpu_regs[uf_cpu_r1_index(pc_op)];
+
+    // load address and value.
+    l_vaddr = ap_types.uf_mem_load_vaddr(cpu.cpu_pc, pc_op, r0, r1);
+    assume tap_addr_perm_r(cpu.cpu_addr_valid[l_vaddr]);
+    if (tap_enclave_metadata_addr_excl[eid][l_vaddr]) {
+        assert (cpu.cpu_owner_map[cpu.cpu_addr_map[l_vaddr]] == eid || 
+                cpu.cpu_owner_map[cpu.cpu_addr_map[l_vaddr]] == tap_enclave_metadata_parent[eid]);
+
+        havoc way; 
+        assume valid_cache_way_index(way);
+
+        call (l_data, excp, hit) = cpu.load_va(l_vaddr, way);
+        assert excp == excp_none;
+        assert excp != excp_os_protection_fault;
+        assert excp != excp_tp_protection_fault;
+
+    } else {
+        hit = false;
+        excp = excp_none;
+        l_data = uf_load_data(l_vaddr, iter);
+    }
+
+    // get data to store to mem.
+    s_vaddr = uf_mem_store_vaddr(cpu.cpu_pc, pc_op, l_data, r0, r1);
+    s_data = ap_types.uf_mem_store_data(cpu.cpu_pc, pc_op, l_data, r0, r1);
+    vaddr = s_vaddr;
+    paddr = cpu.cpu_addr_map[s_vaddr];
+    data = s_data;
+
+    // update mem.
+    assume tap_addr_perm_w(cpu.cpu_addr_valid[s_vaddr]);
+    if (tap_enclave_metadata_addr_excl[eid][s_vaddr]) {
+        assert (cpu.cpu_owner_map[cpu.cpu_addr_map[s_vaddr]] == eid);
+
+        havoc way; 
+        assume valid_cache_way_index(way);
+
+        call (excp, hit) = cpu.store_va(s_vaddr, s_data, way);
+        assert excp == excp_none || excp == excp_out_of_memory_fault;
+        assert excp != excp_os_protection_fault;
+        assert excp != excp_tp_protection_fault;
+
+    }
+
+    // update pc.
+    call cpu.set_cpu_pc(uf_cpu_pc(cpu.cpu_pc, pc_op, l_data, r0, r1));
+    assume tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+    assume tap_enclave_metadata_addr_excl[eid][cpu.cpu_pc];
+    assert cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == eid;
+    // update regs.
+    rd = uf_cpu_r2_index(pc_op);
+    call cpu.update_cpu_regs(rd, uf_cpu_result(cpu.cpu_pc, pc_op, l_data, r0, r1));
+}
+
+procedure [inline] IntegrityAdversarialStep(
+    /* mode       */ mode       : mode_t,
+    /* EuT        */ eid        : tap_enclave_id_t,
+    /* Adversary  */ r_eid      : tap_enclave_id_t,
+    /* Parent EID */ r_parent_eid : tap_enclave_id_t,
+    /* args       */ r_regs     : regs_t,
+    /* operation  */ op         : tap_proof_op_t
+)
+
+    returns (next_mode : mode_t, enclave_dead : boolean)
+
+    // Keep free pool consistent
+    ensures (forall (pa : wap_addr_t, e : tap_enclave_id_t) ::
+              tap_enclave_metadata_wap_addr_free[e][pa] ==> cpu.cpu_owner_map[pa] == e);
+
+
+
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_regs;
+    modifies untrusted_pc;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_excl;
+    modifies tap_enclave_metadata_entrypoint;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_cache_conflict;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies tap_enclave_metadata_postinit_measurement;
+    modifies tap_enclave_metadata_parent;
+    modifies tap_enclave_metadata_child_count;
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies tap_enclave_metadata_bounds_valid;
+    modifies tap_enclave_metadata_region_bounds;
+    modifies cpu;
+{
+    var status            : enclave_op_result_t;
+    var r_addr_valid      : addr_valid_t;
+    var r_addr_map        : addr_map_t;
+    var r_excl_vaddr      : excl_vaddr_t;
+    var r_excl_map        : excl_map_t;
+    var r_bounds          : bounds_t;
+    var r_container_valid : container_valid_t;
+    var r_container_data  : container_data_t;
+    var r_entrypoint      : vaddr_t;
+    var r_vaddr           : vaddr_t;
+    var r_valid           : addr_perm_t;
+    var r_excp            : exception_t;
+    var r_paddr           : wap_addr_t;
+    var r_word            : word_t;
+    var r_bmap            : excl_map_t;
+    var r_bmap_bounds     : bounds_t;
+    var hit               : boolean;
+    var way               : cache_way_index_t;
+
+    // the "default" value which may be overwritten by enter/resume
+    next_mode = mode;
+    // the "default" value which may be overwritten by destroy.
+    enclave_dead = false;
+
+
+    case 
+    (op == tap_proof_op_launch) : {            
+        // launch
+        call InitOSMem(r_container_valid, r_container_data);
+        call (status) = launch(r_eid, r_addr_valid, r_addr_map, 
+                              r_excl_vaddr, r_excl_map, r_bounds, r_entrypoint);
+        assert (r_eid == eid) ==> (status != enclave_op_success);
+        assert next_mode != mode_enclave;
+    } 
+    (op == tap_proof_op_enter) : {      
+        // enter
+        call cpu.set_cpu_regs(r_regs);
+        call (status) = enter(r_eid);
+        // mode == mode_enclave means we are in trace_2.
+        // TODO: Can we do this proof, without assuming the following, essentially figure out what 
+        // to make this happen
+        assert (mode == mode_enclave ==> status == enclave_op_success);
+        if (status == enclave_op_success && r_eid == eid) { 
+            next_mode = mode_enclave; 
+        }
+    } 
+    (op == tap_proof_op_resume) : {     
+        // resume
+        call (status) = resume(r_eid);
+        // mode == mode_enclave means we are in trace_2.
+        assert (mode == mode_enclave ==> status == enclave_op_success);
+        if (status == enclave_op_success && r_eid == eid) { 
+            next_mode = mode_enclave; 
+        }
+    } 
+    (op == tap_proof_op_exit) : {       
+        // exit
+        call (status) = exit();
+        assert next_mode != mode_enclave;
+
+    } 
+    (op == tap_proof_op_pause) : {      
+        // pause.
+        call (status) = pause();
+        assert next_mode != mode_enclave;
+    } 
+    (op == tap_proof_op_destroy) : {    
+        // destroy.
+        call (status) = destroy(r_eid);
+        if (r_eid == eid && status == enclave_op_success) {
+            enclave_dead = true;
+        }
+        assert(mode == mode_untrusted ==> next_mode != mode_enclave);
+        assert next_mode != mode_enclave;
+    } 
+    (op == tap_proof_op_snapshot) : {
+        // snapshot
+        call (status) = snapshot();
+        if (status == enclave_op_success) {
+            next_mode = mode_untrusted;
+        }
+        assert next_mode != mode_enclave;
+    }
+    (op == tap_proof_op_clone) : {
+        // Clone a new enclave
+        call (status) = clone(r_eid, r_parent_eid, r_excl_map, r_bounds);
+        assert (r_eid == eid) ==> (status != enclave_op_success);
+        assert next_mode != mode_enclave;
+    }
+    (op == tap_proof_op_release) : {
+        call (status) = release_blocked_memory(r_bmap, r_bmap_bounds);
+        assert next_mode != mode_enclave;
+    } 
+    (op == tap_proof_op_block) : {
+        call (status) = block_memory_region(r_bmap, r_bmap_bounds);
+        assert next_mode != mode_enclave;
+    } 
+    (op == tap_proof_op_compute) : {    
+        // some adversarial computation
+        if (*) {
+            havoc r_vaddr;
+            havoc r_word;
+            havoc way; assume valid_cache_way_index(way);
+            call (r_excp, hit) = cpu.store_va(r_vaddr, r_word, way);
+        } else {
+            if (*) {
+                call cpu.havoc_cpu_pc();
+                call cpu.havoc_cpu_regs();
+            } else {
+                if (*) {
+                    // update "page" table map.
+                    havoc r_vaddr;
+                    havoc r_paddr;
+                    havoc r_valid;
+                    call cpu.update_cpu_addr_valid(r_vaddr, r_valid);
+                    call cpu.update_cpu_addr_map(r_vaddr, r_paddr);
+                } else {
+                    if (*) {
+                        havoc r_vaddr;
+                        havoc r_paddr;
+                        havoc r_valid;
+                        call (status) = set_enclave_addr_map(r_eid, r_vaddr, r_valid, r_paddr);
+                    }
+                }
+            }
+        }
+    }
+    esac
+} 
+
+define tap_proof_op_valid_in_enclave(o : tap_proof_op_t) : boolean
+= (o == tap_proof_op_compute) ||
+  (o == tap_proof_op_pause)   ||
+  (o == tap_proof_op_snapshot)||
+  (o == tap_proof_op_exit);
+
+procedure [inline] IntegrityEnclaveStep(
+    /* what operation?  */  op : tap_proof_op_t, 
+    /* which iteration? */  iter : integer
+)
+    returns (next_mode : mode_t, vaddr : vaddr_t, paddr : wap_addr_t, data : word_t)
+
+
+    //modifies untrusted_addr_valid;
+    //modifies untrusted_addr_map;
+    //modifies untrusted_regs;
+    //modifies untrusted_pc;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    //modifies tap_enclave_metadata_entrypoint;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_postinit_measurement;
+    modifies tap_enclave_metadata_is_snapshot;
+    //modifies tap_enclave_metadata_cache_conflict;
+    modifies cpu;
+{
+    var status : enclave_op_result_t;
+    assert tap_proof_op_valid_in_enclave(op);
+
+    vaddr = k0_vaddr_t;
+    paddr = k0_wap_addr_t;
+    data = k0_word_t;
+
+    // in enclave-mode:
+    case
+    (op == tap_proof_op_compute) : {
+        call (vaddr, paddr, data) = EnclaveComputation(iter);
+        next_mode = mode_enclave;
+    } 
+    (op == tap_proof_op_pause) : {
+        call (status) = pause();
+        assert status == enclave_op_success;
+        next_mode = mode_untrusted;
+    }
+    (op == tap_proof_op_snapshot) : {
+        next_mode = mode_enclave;
+        call (status) = snapshot();
+        if (status == enclave_op_success) {
+            next_mode = mode_untrusted;
+        }
+    }
+    (op == tap_proof_op_exit) : {
+        call (status) = exit();
+        assert status == enclave_op_success;
+        next_mode = mode_untrusted;
+    }
+    esac
+}
+
+
+
+//
+// Utilities for confidentiality proofs
+//
+procedure [inline] MemObserverComputation(
+    /* next PC value.           */  r_pc : vaddr_t,
+    /* registers to read/write. */  r_read : regindex_t, r_write : regindex_t, r_data: word_t,
+    /* mem. to read/write.      */  l_vaddr: vaddr_t, s_vaddr: vaddr_t, s_data : word_t,
+    /* "pt" entry to read       */  r_pt_eid : tap_enclave_id_t, r_pt_va : vaddr_t,
+    /* "pt" entry to change.    */  pt_eid : tap_enclave_id_t, pt_vaddr: vaddr_t, 
+    /* "pt" entry to change.    */  pt_valid: addr_perm_t, pt_paddr: wap_addr_t)
+    returns (observation : word_t)
+    requires valid_regindex(r_read);
+    requires valid_regindex(r_write);
+
+    modifies untrusted_addr_valid;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies untrusted_addr_map;
+    modifies cpu;
+{
+    var excp         : exception_t;
+    var l_word       : word_t;
+    var r_word       : word_t;
+    var hit_1, hit_2 : boolean;
+    var valid        : addr_perm_t;
+    var paddr        : wap_addr_t;
+    var status       : enclave_op_result_t;
+    var l_way, s_way : cache_way_index_t;
+
+    assume valid_cache_way_index(l_way);
+    assume valid_cache_way_index(s_way);
+
+    call cpu.set_cpu_pc(r_pc);
+    call cpu.update_cpu_regs(r_write, r_data);
+    // store
+    call (excp, hit_1) = cpu.store_va(s_vaddr, s_data, s_way);
+    // load
+    call (l_word, excp, hit_2) = cpu.load_va(l_vaddr, l_way);
+    r_word = cpu.cpu_regs[r_read];
+    observation = uf_observation_mem(cpu.cpu_pc, l_word, r_word);
+
+    if (pt_eid == tap_null_enc_id) {
+        call set_addr_map(pt_vaddr, pt_paddr, pt_valid);
+    } else {
+        call (status) = set_enclave_addr_map(pt_eid, pt_vaddr, pt_valid, pt_paddr);
+    }
+}
+
+
+procedure [inline] CacheObserverComputation(
+    /* next PC value.           */  r_pc : vaddr_t,
+    /* registers to read/write. */  r_read : regindex_t, r_write : regindex_t, r_data: word_t,
+    /* mem. to read/write.      */  l_vaddr: vaddr_t, s_vaddr: vaddr_t, s_data : word_t,
+    /* "pt" entry to read       */  r_pt_eid : tap_enclave_id_t, r_pt_va : vaddr_t,
+    /* "pt" entry to change.    */  pt_eid : tap_enclave_id_t, pt_vaddr: vaddr_t, 
+    /* "pt" entry to change.    */  pt_valid: addr_perm_t, pt_paddr: wap_addr_t,
+    /* ways to change.          */  l_way, s_way : cache_way_index_t)
+    returns (observation : word_t, hit_1 : boolean, hit_2 : boolean,
+             excp_1 : exception_t, excp_2 : exception_t)
+    requires valid_regindex(r_read);
+    requires valid_regindex(r_write);
+    requires valid_cache_way_index(s_way);
+    requires valid_cache_way_index(l_way);
+
+    ensures ((!tap_addr_perm_w(old(cpu.cpu_addr_valid)[s_vaddr]) ||
+              (cpu.cpu_owner_map[old(cpu.cpu_addr_map)[s_vaddr]] != tap_null_enc_id && cpu.cpu_owner_map[old(cpu.cpu_addr_map)[s_vaddr]] != cpu.cpu_enclave_id)) &&
+             (!tap_addr_perm_r(old(cpu.cpu_addr_valid)[l_vaddr]) ||
+              (cpu.cpu_owner_map[old(cpu.cpu_addr_map)[l_vaddr]] != tap_null_enc_id && cpu.cpu_owner_map[old(cpu.cpu_addr_map)[l_vaddr]] != cpu.cpu_enclave_id)))
+             ==> (observation == uf_observation_cache(false, false));
+
+    ensures (forall (p : wap_addr_t, w : cache_way_index_t) ::
+               ((paddr2set(p) != paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) || w != s_way) && 
+                (paddr2set(p) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || w != l_way))
+                  ==> ((cpu.cache.cache_valid_map[paddr2set(p), w] == old(cpu.cache.cache_valid_map)[paddr2set(p), w]) &&
+                       (cpu.cache.cache_tag_map[paddr2set(p), w] == old(cpu.cache.cache_tag_map)[paddr2set(p), w])));
+    ensures (cpu.cpu_cache_enabled) ==>
+            (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                    ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) && w == s_way) &&
+                    (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || s_way != l_way) &&
+                    (excp_1 != excp_none || hit_1))
+                    ==> 
+                        (cpu.cache.cache_valid_map[paddr2set(p), w] == old(cpu.cache.cache_valid_map)[paddr2set(p), w] &&
+                         cpu.cache.cache_tag_map[paddr2set(p), w] == old(cpu.cache.cache_tag_map)[paddr2set(p), w]));
+
+    ensures (cpu.cpu_cache_enabled) ==>
+            (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                    ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) && w == s_way) &&
+                    (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || s_way != l_way) &&
+                    (excp_1 == excp_none && !hit_1))
+                    ==> 
+                        (cpu.cache.cache_valid_map[paddr2set(p), w] == true &&
+                         cpu.cache.cache_tag_map[paddr2set(p), w] == paddr2tag(old(cpu.cpu_addr_map)[s_vaddr])));
+
+    ensures (cpu.cpu_cache_enabled) ==>
+              (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                    ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) && w == l_way) &&
+                    (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || s_way != l_way) &&
+                    (excp_2 != excp_none || hit_2))
+                    ==> 
+                        (cpu.cache.cache_valid_map[paddr2set(p), w] == old(cpu.cache.cache_valid_map)[paddr2set(p), w] &&
+                         cpu.cache.cache_tag_map[paddr2set(p), w] == old(cpu.cache.cache_tag_map)[paddr2set(p), w]));
+
+    ensures (cpu.cpu_cache_enabled) ==>
+              (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                    ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) && w == l_way) &&
+                    (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || s_way != l_way) &&
+                    (excp_2 == excp_none && !hit_2))
+                    ==> 
+                        (cpu.cache.cache_valid_map[paddr2set(p), w] == true &&
+                         cpu.cache.cache_tag_map[paddr2set(p), w] == paddr2tag(old(cpu.cpu_addr_map)[l_vaddr])));
+
+    // Invariants for when s_vaddr and p_addr map to the same location in the cache
+    ensures (cpu.cpu_cache_enabled) ==>
+              (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) && w == s_way) &&
+                 (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) == paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) && s_way == l_way) &&
+                  ((hit_1 && hit_2) || 
+                   (excp_2 != excp_none && hit_1 && !hit_2) ||
+                   (excp_1 != excp_none && !hit_1 && hit_2) ||
+                   (excp_1 != excp_none && excp_2 != excp_none)))
+                ==> (cpu.cache.cache_valid_map[paddr2set(p), w] == old(cpu.cache.cache_valid_map)[paddr2set(p), w] && 
+                     cpu.cache.cache_tag_map[paddr2set(p), w] == old(cpu.cache.cache_tag_map)[paddr2set(p), w]));
+
+    ensures (cpu.cpu_cache_enabled) ==> 
+              (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) && w == s_way) &&
+                 (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) == paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) && s_way == l_way) &&
+                  ((excp_2 == excp_none && hit_1 && !hit_2) ||
+                   (excp_1 != excp_none && excp_2 == excp_none && !hit_1 && !hit_2) ||
+                   (excp_1 == excp_none && excp_2 == excp_none && !hit_1 && !hit_2)))
+                ==> (cpu.cache.cache_valid_map[paddr2set(p), w] == true &&
+                     cpu.cache.cache_tag_map[paddr2set(p), w] == paddr2tag(old(cpu.cpu_addr_map)[l_vaddr])));
+
+    ensures (cpu.cpu_cache_enabled) ==> 
+              (forall (p : wap_addr_t, w : cache_way_index_t) ::
+                ((paddr2set(p) == paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) && w == s_way) &&
+                 (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) == paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) && s_way == l_way) &&
+                   ((excp_1 == excp_none && !hit_1 && hit_2) ||
+                    (excp_1 == excp_none && excp_2 != excp_none && !hit_1 && !hit_2)))
+                ==> (cpu.cache.cache_valid_map[paddr2set(p), w] == true &&
+                     cpu.cache.cache_tag_map[paddr2set(p), w] == paddr2tag(old(cpu.cpu_addr_map)[s_vaddr])));
+
+  
+    ensures (s_vaddr != l_vaddr || s_way != l_way)
+              ==> ((cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[s_vaddr]), s_way] == old(cpu.cache.cache_valid_map)[paddr2set(old(cpu.cpu_addr_map)[s_vaddr]), s_way]) ||
+                   (cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[s_vaddr]), s_way] == true));
+    ensures ((cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[l_vaddr]), l_way] == old(cpu.cache.cache_valid_map)[paddr2set(old(cpu.cpu_addr_map)[l_vaddr]), l_way]) ||
+                   (cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[l_vaddr]), l_way] == true));
+
+    ensures (!cpu.cpu_cache_enabled) ==> 
+              (cpu.cache.cache_valid_map == old(cpu.cache.cache_valid_map) && cpu.cache.cache_tag_map == old(cpu.cache.cache_tag_map));
+
+    ensures (excp_1 == excp_none && cpu.cpu_cache_enabled && !hit_1 &&
+             (paddr2set(old(cpu.cpu_addr_map)[s_vaddr]) != paddr2set(old(cpu.cpu_addr_map)[l_vaddr]) || s_way != l_way)) 
+              ==> ((cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[s_vaddr]), s_way] == true) &&
+                    (cpu.cache.cache_tag_map[paddr2set(old(cpu.cpu_addr_map)[s_vaddr]), s_way] == paddr2tag(old(cpu.cpu_addr_map)[s_vaddr])));
+    
+    ensures (excp_2 == excp_none && cpu.cpu_cache_enabled && !hit_2)
+              ==> ((cpu.cache.cache_valid_map[paddr2set(old(cpu.cpu_addr_map)[l_vaddr]), l_way] == true) &&
+                    (cpu.cache.cache_tag_map[paddr2set(old(cpu.cpu_addr_map)[l_vaddr]), l_way] == paddr2tag(old(cpu.cpu_addr_map)[l_vaddr])));
+
+    
+
+    ensures (cpu.cpu_cache_enabled && hit_1 && hit_2)
+            ==> (cpu.cache.cache_valid_map == old(cpu.cache.cache_valid_map) && cpu.cache.cache_tag_map == old(cpu.cache.cache_tag_map));
+
+
+    ensures (excp_1 != excp_none) ==> (hit_1 == false);
+    ensures (excp_2 != excp_none) ==> (hit_2 == false);
+    ensures (!cpu.cpu_cache_enabled) ==> (hit_1 == false && hit_2 == false);
+ 
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies cpu;
+{
+    var excp         : exception_t;
+    var l_word       : word_t;
+    var r_word       : word_t;
+    var valid        : addr_perm_t;
+    var paddr        : wap_addr_t;
+    var status       : enclave_op_result_t;
+
+    call cpu.set_cpu_pc(r_pc);
+    call cpu.update_cpu_regs(r_write, r_data);
+    call (excp_1, hit_1) = cpu.store_va(s_vaddr, s_data, s_way);
+    call (valid, paddr) = get_enclave_addr_map(r_pt_eid, r_pt_va);
+    call (l_word, excp_2, hit_2) = cpu.load_va(l_vaddr, l_way);
+    r_word = cpu.cpu_regs[r_read];
+    observation = uf_observation_cache(hit_1, hit_2);
+
+    if (pt_eid == tap_null_enc_id) {
+        call set_addr_map(pt_vaddr, pt_paddr, pt_valid);
+    } else {
+        call (status) = set_enclave_addr_map(pt_eid, pt_vaddr, pt_valid, pt_paddr);
+    }
+}
+
+
+procedure [inline] PTObserverComputation(
+    /* next PC value.           */  r_pc : vaddr_t,
+    /* registers to read/write. */  r_read : regindex_t, r_write : regindex_t, r_data: word_t,
+    /* mem. to read/write.      */  l_vaddr: vaddr_t, s_vaddr: vaddr_t, s_data : word_t,
+    /* "pt" entry to read       */  r_pt_eid : tap_enclave_id_t, r_pt_va : vaddr_t,
+    /* "pt" entry to change.    */  pt_eid : tap_enclave_id_t, pt_vaddr: vaddr_t, 
+    /* "pt" entry to change.    */  pt_valid: addr_perm_t, pt_paddr: wap_addr_t)
+    returns (observation : word_t, excp : exception_t)
+    requires valid_regindex(r_read);
+    requires valid_regindex(r_write);
+    ensures (pt_eid == tap_null_enc_id && cpu.cpu_enclave_id == tap_null_enc_id)
+              ==> ((forall (va : vaddr_t) ::
+                    (va != pt_vaddr) ==>
+                      (cpu.cpu_addr_valid[va] == old(untrusted_addr_valid)[va])) &&
+                    (cpu.cpu_addr_valid[pt_vaddr] == pt_valid));
+    ensures (pt_eid == tap_null_enc_id && cpu.cpu_enclave_id != tap_null_enc_id)
+              ==> (forall (va : vaddr_t) ::
+                    (va != s_vaddr)
+                      ==> (cpu.cpu_addr_valid[va] == old(cpu.cpu_addr_valid)[va]));
+    ensures (pt_eid != tap_null_enc_id)
+              ==> (forall (va : vaddr_t) ::
+                    (va != s_vaddr)
+                      ==> (cpu.cpu_addr_valid[va] == old(cpu.cpu_addr_valid)[va]));
+    ensures (pt_eid != tap_null_enc_id && excp == excp_none)
+              ==> (cpu.cpu_addr_valid[s_vaddr] == tap_set_addr_perm_a(old(cpu.cpu_addr_valid)[s_vaddr]));
+    ensures (pt_eid != tap_null_enc_id && excp != excp_none)
+            ==> (cpu.cpu_addr_valid[s_vaddr] == old(cpu.cpu_addr_valid)[s_vaddr]);
+    ensures (pt_eid == tap_null_enc_id && cpu.cpu_enclave_id != tap_null_enc_id  && excp == excp_none)
+              ==> (cpu.cpu_addr_valid[s_vaddr] == tap_set_addr_perm_a(old(cpu.cpu_addr_valid)[s_vaddr]));
+    ensures (pt_eid == tap_null_enc_id && cpu.cpu_enclave_id != tap_null_enc_id &&  excp != excp_none)
+            ==> (cpu.cpu_addr_valid[s_vaddr] == old(cpu.cpu_addr_valid)[s_vaddr]);
+    ensures (block_os_ev_read && (tap_enclave_metadata_addr_excl[r_pt_eid])[r_pt_va])
+            ==> (observation == uf_observation_pt(k0_addr_perm_t, k0_wap_addr_t));
+    ensures (cpu.cpu_enclave_id != tap_null_enc_id || !tap_enclave_metadata_valid[r_pt_eid])
+            ==> (observation == uf_observation_pt(k0_addr_perm_t, k0_wap_addr_t));
+    ensures (cpu.cpu_enclave_id == tap_null_enc_id && tap_enclave_metadata_valid[r_pt_eid] && (!block_os_ev_read || !((tap_enclave_metadata_addr_excl[r_pt_eid])[r_pt_va])))
+            ==> (observation == uf_observation_pt(
+                             (old(tap_enclave_metadata_addr_valid)[r_pt_eid])[r_pt_va],
+                             (old(tap_enclave_metadata_addr_map)[r_pt_eid])[r_pt_va]));
+
+
+
+    
+    
+ 
+    modifies untrusted_addr_valid;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies untrusted_addr_map;
+    modifies cpu;
+{
+    var l_word       : word_t;
+    var r_word       : word_t;
+    var hit_1, hit_2 : boolean;
+    var valid        : addr_perm_t;
+    var paddr        : wap_addr_t;
+    var status       : enclave_op_result_t;
+    var l_way, s_way : cache_way_index_t;
+    
+    havoc excp;
+
+    assume (excp != excp_none);
+    assume valid_cache_way_index(l_way);
+    assume valid_cache_way_index(s_way);
+
+    // make observation.
+    call (valid, paddr) = get_enclave_addr_map(r_pt_eid, r_pt_va);
+    observation = uf_observation_pt(valid, paddr);
+
+    // change state.
+    call cpu.set_cpu_pc(r_pc);
+    call cpu.update_cpu_regs(r_write, r_data);
+    call (excp, hit_1) = cpu.store_va(s_vaddr, s_data, s_way);
+    if (pt_eid == tap_null_enc_id) {
+        call set_addr_map(pt_vaddr, pt_paddr, pt_valid);
+    } else {
+        call (status) = set_enclave_addr_map(pt_eid, pt_vaddr, pt_valid, pt_paddr);
+    }
+}
+
+procedure [inline] ObserverStep(
+    /* observer          */ observer          : observer_t,
+    /* Current mode      */ mode              : mode_t,
+    /* Secret Enclave    */ eid               : tap_enclave_id_t,
+    /* Secret Parent     */ p_eid             : tap_enclave_id_t,
+    /* p_eid valid?      */ p_eid_valid       : boolean,
+    /* Adversary Enclave */ r_eid             : tap_enclave_id_t,
+    /* Parent Enclave    */ r_parent_eid      : tap_enclave_id_t,
+    /* Operation.        */ op                : tap_proof_op_t,
+    /* next PC value.    */ r_pc              : vaddr_t,
+    /* reg to read.      */ r_read            : regindex_t,
+    /* reg to write      */ r_write           : regindex_t,
+    /* data to write     */ r_data            : word_t,
+    /* mem. to read.     */ l_vaddr           : vaddr_t,
+    /* mem to write      */ s_vaddr           : vaddr_t,
+    /* data to write     */ s_data            : word_t,
+    /* pt entry to read  */ r_pt_eid          : tap_enclave_id_t, 
+    /* pt entry to read  */ r_pt_va           : vaddr_t,
+    /* pt eid            */ pt_eid            : tap_enclave_id_t,
+    /* pt vaddr          */ pt_vaddr          : vaddr_t,
+    /* pt valid          */ pt_valid          : addr_perm_t,
+    /* pt paddr          */ pt_paddr          : wap_addr_t,
+    /* VA->PA valid      */ r_addr_valid      : addr_valid_t,
+    /* VA->PA map        */ r_addr_map        : addr_map_t,
+    /* VA->excl map      */ r_excl_vaddr      : excl_vaddr_t,
+    /* Private Mem Map   */ r_excl_map        : excl_map_t,
+    /* Region Bounds     */ r_bounds          : bounds_t,
+    /* Container Valid   */ r_container_valid : container_valid_t,
+    /* Container Data    */ r_container_data  : container_data_t,
+    /* Entrypoint        */ r_entrypoint      : vaddr_t,
+    /* blocked mem       */ r_bmap            : excl_map_t,
+    /* blocked mem bound */ r_bmap_bounds     : bounds_t,
+    /* ways to change.   */ l_way, s_way      : cache_way_index_t)
+
+    returns (observation: word_t, next_mode : mode_t, enclave_dead : boolean, status : enclave_op_result_t, excp_1 : exception_t, excp_2 : exception_t, hit_1 : boolean, hit_2 : boolean)
+    // PC stays reasonable.
+    // Don't mess up TAP invariants.
+    requires valid_regindex(r_read);
+    requires valid_regindex(r_write);
+    requires (observer == k_mem_observer_t   || 
+              observer == k_cache_observer_t ||
+              observer == k_pt_observer_t);
+
+    requires valid_cache_way_index(s_way);
+    requires valid_cache_way_index(l_way);
+
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+
+    
+    ensures (op == tap_proof_op_compute) ==> 
+                (cpu.cpu_enclave_id == old(cpu.cpu_enclave_id) &&
+                 tap_enclave_metadata_valid == old(tap_enclave_metadata_valid) &&
+                 tap_enclave_metadata_addr_excl == old(tap_enclave_metadata_addr_excl));
+
+
+
+
+    modifies untrusted_addr_valid;
+    modifies untrusted_addr_map;
+    modifies untrusted_regs;
+    modifies untrusted_pc;
+    modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_excl;
+    modifies tap_enclave_metadata_entrypoint;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_cache_conflict;
+    modifies tap_enclave_metadata_wap_addr_free;
+    modifies tap_enclave_metadata_bounds_valid;
+    modifies tap_enclave_metadata_region_bounds;
+    modifies tap_enclave_metadata_child_count;
+    modifies tap_enclave_metadata_parent;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies tap_enclave_metadata_postinit_measurement;
+    modifies cpu;
+{
+    // "default" for the next mode.
+    next_mode = mode;
+    // "default" for whether we kill enclave eid.
+    enclave_dead = false;
+
+    // start with a dummy observation.
+    observation = k0_word_t;
+    status = enclave_op_success;
+    havoc excp_1;
+    havoc excp_2;
+    assume (excp_1 != excp_none);
+    assume (excp_2 != excp_none);
+    hit_1 = false;
+    hit_2 = false;
+
+    case
+    (op == tap_proof_op_compute) : {
+        case
+        (observer == k_mem_observer_t) : {
+            call (observation) = MemObserverComputation(r_pc, r_read, r_write, r_data,
+                                                       l_vaddr, s_vaddr, s_data,
+                                                       r_pt_eid, r_pt_va,
+                                                       pt_eid, pt_vaddr, pt_valid, pt_paddr);
+        } 
+        (observer == k_cache_observer_t) : {
+            call (observation, hit_1, hit_2, excp_1, excp_2) = CacheObserverComputation(r_pc, r_read, r_write, r_data,
+                                                         l_vaddr, s_vaddr, s_data,
+                                                         r_pt_eid, r_pt_va,
+                                                         pt_eid, pt_vaddr, pt_valid, pt_paddr,
+                                                         l_way, s_way);
+        } 
+        (observer == k_pt_observer_t) : {
+            call (observation, excp_1) = PTObserverComputation(r_pc, r_read, r_write, r_data,
+                                                      l_vaddr, s_vaddr, s_data,
+                                                      r_pt_eid, r_pt_va,
+                                                      pt_eid, pt_vaddr, pt_valid, pt_paddr);
+            assert (block_os_ev_read && (tap_enclave_metadata_addr_excl[r_pt_eid])[r_pt_va])
+            ==> (observation == uf_observation_pt(k0_addr_perm_t, k0_wap_addr_t));
+            assert (cpu.cpu_enclave_id != tap_null_enc_id || !tap_enclave_metadata_valid[r_pt_eid])
+            ==> (observation == uf_observation_pt(k0_addr_perm_t, k0_wap_addr_t));
+
+        }
+        esac
+    } 
+    (op == tap_proof_op_launch) : {
+        // can't put current pc inside the enclave.
+        assume !r_excl_map[cpu.cpu_addr_map[cpu.cpu_pc]];
+        call InitOSMem(r_container_valid, r_container_data);
+        call (status) = launch(r_eid, r_addr_valid, r_addr_map, 
+                              r_excl_vaddr, r_excl_map, r_bounds, r_entrypoint);
+                              
+        assert (r_eid == eid) ==> (status != enclave_op_success);
+    } 
+    (op == tap_proof_op_destroy) : {
+        call (status) = destroy(r_eid);
+        // the enclave has been destroyed.
+        if (r_eid == eid && status == enclave_op_success) {
+            enclave_dead = true;
+        }
+    } 
+    (op == tap_proof_op_enter) : {
+        call (status) = enter(r_eid);
+        assert (cpu.cpu_enclave_id == tap_null_enc_id && r_eid == eid) ==> 
+                (status == enclave_op_success);
+        // switch to enclave mode.
+        if (r_eid == eid && status == enclave_op_success) {
+            next_mode = mode_enclave;
+        }
+    } 
+    (op == tap_proof_op_snapshot) : {
+        // snapshot
+        call (status) = snapshot();
+        if (status == enclave_op_success) {
+            next_mode = mode_untrusted;
+        }
+        assert next_mode != mode_enclave;
+    }
+    (op == tap_proof_op_clone) : {
+        // Clone a new enclave
+        call (status) = clone(r_eid, r_parent_eid, r_excl_map, r_bounds);
+        assert (r_eid == eid) ==> (status != enclave_op_success);
+        assert next_mode != mode_enclave;
+    }
+    (op == tap_proof_op_exit) : {
+        call (status) = exit();
+    } 
+    (op == tap_proof_op_resume) : {
+        call (status) = resume(r_eid);
+        // switch to enclave mode.
+        assert (cpu.cpu_enclave_id == tap_null_enc_id && r_eid == eid && tap_enclave_metadata_paused[eid]) ==> 
+                (status == enclave_op_success);
+        if (r_eid == eid && status == enclave_op_success) {
+            next_mode = mode_enclave;
+        }
+    } 
+    (op == tap_proof_op_pause) : {
+        call (status) = pause();
+    } 
+    (op == tap_proof_op_release) : {
+        call (status) = release_blocked_memory(r_bmap, r_bmap_bounds);
+    } 
+    (op == tap_proof_op_block) : {
+        call (status) = block_memory_region(r_bmap, r_bmap_bounds);
+    }
+    esac
+}
+
+
+procedure [inline] EnclaveStep(
+    /* Current mode */      mode              : mode_t,
+    /* Secret Enclave */    eid               : tap_enclave_id_t,
+    /* Operation. */        op                : tap_proof_op_t)
+
+    returns (
+        /* mode     */  next_mode : mode_t, 
+        /* read     */  load_addr : vaddr_t, l_way : cache_way_index_t,
+        /* store    */  store_addr : vaddr_t, store_data : word_t, s_way : cache_way_index_t
+    )
+
+    requires cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == cpu.cpu_enclave_id || 
+             cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == tap_enclave_metadata_parent[cpu.cpu_enclave_id];
+    requires (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+    ensures (forall (e : tap_enclave_id_t) :: e != tap_invalid_enc_id ==> tap_enclave_metadata_parent[e] != e);
+
+    //modifies tap_enclave_metadata_valid;
+    modifies tap_enclave_metadata_addr_map;
+    modifies tap_enclave_metadata_addr_valid;
+    modifies tap_enclave_metadata_addr_excl;
+    modifies tap_enclave_metadata_pc;
+    modifies tap_enclave_metadata_regs;
+    modifies tap_enclave_metadata_paused;
+    modifies tap_enclave_metadata_cache_conflict;
+    modifies tap_enclave_metadata_postinit_measurement;
+    modifies tap_enclave_metadata_is_snapshot;
+    modifies cpu;
+{
+    var vaddr  : vaddr_t;
+    var word   : word_t;
+    var excp   : exception_t;
+    var status : enclave_op_result_t;
+    var hit    : boolean;
+    var owner  : tap_enclave_id_t;
+    var way    : cache_way_index_t;
+
+    case
+    (op == tap_proof_op_compute) : {
+        // do whatever.
+        call cpu.havoc_cpu_pc();
+        call cpu.havoc_cpu_regs();
+
+        // fetch from whereever inside the enclave.
+        assume tap_enclave_metadata_addr_excl[eid][cpu.cpu_pc];
+        assume tap_addr_perm_x(cpu.cpu_addr_valid[cpu.cpu_pc]);
+        assume cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == eid ||
+               cpu.cpu_owner_map[cpu.cpu_addr_map[cpu.cpu_pc]] == tap_enclave_metadata_parent[eid];
+        //assert(false);
+
+        havoc way; assume valid_cache_way_index(way);
+        call (word, excp, hit) = cpu.fetch_va(cpu.cpu_pc, way);
+        assert (excp == excp_none);
+
+        // load from whereever inside the enclave.
+        havoc load_addr;
+        assume tap_addr_perm_r(cpu.cpu_addr_valid[load_addr]);
+        owner = cpu.cpu_owner_map[cpu.cpu_addr_map[load_addr]];
+        assume owner == eid || owner == tap_null_enc_id || owner == tap_enclave_metadata_parent[eid];
+        havoc l_way; assume valid_cache_way_index(l_way);
+        call (word, excp, hit) = cpu.load_va(load_addr, l_way);
+        assert (excp == excp_none);
+        assert excp != excp_out_of_memory_fault;
+        assert excp != excp_os_protection_fault;
+        assert excp != excp_tp_protection_fault;
+
+
+        // store whatever inside the enclave.
+        havoc store_addr; havoc store_data;
+        assume tap_addr_perm_w(cpu.cpu_addr_valid[store_addr]);
+        owner = cpu.cpu_owner_map[cpu.cpu_addr_map[store_addr]];
+        if (tap_enclave_metadata_parent[eid] == tap_invalid_enc_id) {
+            assume owner == eid || owner == tap_null_enc_id;
+        } else {
+            assume owner == eid || owner == tap_null_enc_id || owner == tap_enclave_metadata_parent[eid];
+        }
+        havoc s_way; assume valid_cache_way_index(s_way);
+        call (excp, hit) = cpu.store_va(store_addr, store_data, s_way);
+        assert excp == excp_none || excp == excp_out_of_memory_fault;
+        assert excp != excp_os_protection_fault;
+        assert excp != excp_tp_protection_fault;
+        store_data = store_data;
+
+        // stay in the same mode.
+        next_mode = mode;
+
+        //assert(false);
+    } 
+    (op == tap_proof_op_snapshot) : {
+        call (status) = snapshot();
+        if (status == enclave_op_success) {
+            next_mode = mode_untrusted;
+        } else {
+            next_mode = mode;
+        }
+        assert status == enclave_op_success ==> next_mode == mode_untrusted;
+        assert status != enclave_op_success ==> next_mode == mode;
+    }
+    (op == tap_proof_op_exit) : {
+        call (status) = exit();
+        assert status == enclave_op_success;
+        // switch back to the observer. 
+        next_mode = mode_untrusted;
+    } 
+    (op == tap_proof_op_pause) : {
+        call (status) = pause();
+        assert status == enclave_op_success;
+        // switch back to the observer. 
+        next_mode = mode_untrusted;
+    }
+    esac
+}
+
+procedure [inline] SetInitState(
+  _cpu_mem : mem_t,
+  _cpu_regs : regs_t,
+  _cpu_pc : vaddr_t,
+  _cpu_enclave_id : tap_enclave_id_t,
+  _cpu_addr_valid : addr_valid_t,
+  _cpu_addr_map : addr_map_t,
+  _cpu_owner_map : owner_map_t,
+  _cache_valid_map : cache_valid_map_t,
+  _cache_tag_map : cache_tag_map_t,
+  _untrusted_addr_valid : addr_valid_t,
+  _untrusted_addr_map : addr_map_t,
+  _untrusted_regs : regs_t,
+  _untrusted_pc : vaddr_t,
+  _tap_enclave_metadata_valid : tap_enclave_metadata_valid_t,
+  _tap_enclave_metadata_addr_map : tap_enclave_metadata_addr_map_t,
+  _tap_enclave_metadata_addr_valid : tap_enclave_metadata_addr_valid_t,
+  _tap_enclave_metadata_addr_excl : tap_enclave_metadata_addr_excl_t,
+  _tap_enclave_metadata_entrypoint : tap_enclave_metadata_entrypoint_t,
+  _tap_enclave_metadata_pc : tap_enclave_metadata_pc_t,
+  _tap_enclave_metadata_regs : tap_enclave_metadata_regs_t,
+  _tap_enclave_metadata_paused : tap_enclave_metadata_paused_t,
+  _tap_enclave_metadata_cache_conflict : tap_enclave_metadata_cache_conflict_t,
+  _tap_enclave_metadata_is_snapshot : tap_enclave_metadata_is_snapshot_t,
+  _tap_enclave_metadata_child_count : tap_enclave_metadata_child_count_t,
+  _tap_enclave_metadata_parent : tap_enclave_metadata_parent_t,
+  _tap_enclave_metadata_wap_addr_free : tap_enclave_metadata_wap_addr_free_t,
+  _tap_enclave_metadata_postinit_measurement : tap_enclave_metadata_measurement_t,
+  _tap_enclave_metadata_region_bounds : tap_enclave_metadata_region_bounds_t,
+  _tap_enclave_metadata_bounds_valid : tap_enclave_metadata_bounds_valid_t
+)
+  modifies untrusted_addr_valid;
+  modifies untrusted_addr_map;
+  modifies untrusted_regs;
+  modifies untrusted_pc;
+  modifies tap_enclave_metadata_valid;
+  modifies tap_enclave_metadata_addr_map;
+  modifies tap_enclave_metadata_addr_valid;
+  modifies tap_enclave_metadata_addr_excl;
+  modifies tap_enclave_metadata_entrypoint;
+  modifies tap_enclave_metadata_pc;
+  modifies tap_enclave_metadata_regs;
+  modifies tap_enclave_metadata_paused;
+  modifies tap_enclave_metadata_cache_conflict;
+  modifies tap_enclave_metadata_is_snapshot;
+  modifies tap_enclave_metadata_child_count;
+  modifies tap_enclave_metadata_parent;
+  modifies tap_enclave_metadata_wap_addr_free;
+  modifies tap_enclave_metadata_postinit_measurement;
+  modifies tap_enclave_metadata_region_bounds;
+  modifies tap_enclave_metadata_bounds_valid;
+  modifies cpu;
+{
+  untrusted_addr_valid                      = _untrusted_addr_valid;
+  untrusted_addr_map                        = _untrusted_addr_map;
+  untrusted_regs                            = _untrusted_regs;
+  untrusted_pc                              = _untrusted_pc;
+  tap_enclave_metadata_valid                = _tap_enclave_metadata_valid;
+  tap_enclave_metadata_addr_map             = _tap_enclave_metadata_addr_map;
+  tap_enclave_metadata_addr_valid           = _tap_enclave_metadata_addr_valid;
+  tap_enclave_metadata_addr_excl            = _tap_enclave_metadata_addr_excl;
+  tap_enclave_metadata_entrypoint           = _tap_enclave_metadata_entrypoint;
+  tap_enclave_metadata_pc                   = _tap_enclave_metadata_pc;
+  tap_enclave_metadata_regs                 = _tap_enclave_metadata_regs;
+  tap_enclave_metadata_paused               = _tap_enclave_metadata_paused;
+  tap_enclave_metadata_cache_conflict       = _tap_enclave_metadata_cache_conflict;
+  tap_enclave_metadata_is_snapshot          = _tap_enclave_metadata_is_snapshot;
+  tap_enclave_metadata_child_count          = _tap_enclave_metadata_child_count;
+  tap_enclave_metadata_parent               = _tap_enclave_metadata_parent;
+  tap_enclave_metadata_wap_addr_free        = _tap_enclave_metadata_wap_addr_free;
+  tap_enclave_metadata_postinit_measurement = _tap_enclave_metadata_postinit_measurement;
+  tap_enclave_metadata_region_bounds        = _tap_enclave_metadata_region_bounds;
+  tap_enclave_metadata_bounds_valid         = _tap_enclave_metadata_bounds_valid;
+  
+
+  call cpu.set_cpu_state(_cpu_enclave_id,
+                         _cpu_addr_map,
+                         _cpu_addr_valid,
+                         _cpu_pc,
+                         _cpu_regs);
+  call cpu.set_cpu_owner_map(_cpu_owner_map);
+  call cpu.set_cpu_mem(_cpu_mem);
+  call cpu.set_cache(_cache_valid_map, _cache_tag_map);
+}
+
+
+
+control {
+  set_solver_option(":mbqi", false);
+  set_solver_option(":case_split", 0);
+  set_solver_option(":relevancy", 0);
+  set_solver_option(":threads", 4);
+  set_solver_option(":blast_full", true);
+
+  //do_mappings_alias_verif = verify(do_mappings_alias_v);
+  paddr_conflict_verif = verify(does_paddr_conflict);                     //passes
+  enclave_conflict_verif = verify(does_enclave_conflict);                 //passes
+  set_addr_map_verif = verify(set_addr_map);                              //no assertions to check
+  get_enclave_addr_map_verif = verify(get_enclave_addr_map);              //no assertions to check
+  set_enclave_addr_map_verif = verify(set_enclave_addr_map);              //no assertions to check
+  tap_init_verif = verify(initialize_tap);                                //passes
+  launch_verif = verify(launch);                                          //passes
+  enter_verif  = verify(enter);                                           //passes
+  resume_verif = verify(resume);                                          //passes
+  exit_verif   = verify(exit);                                            //passes
+  pause_verif  = verify(pause);                                           //passes
+  destroy_verif = verify(destroy);                                        //passes
+  block_memory_verif = verify(block_memory_region);                       //passes
+  release_memory_verif = verify(release_blocked_memory);                  //passes
+  snapshot_verif = verify(snapshot);                                      //
+  clone_verify = verify(clone);
+  tap_addr_valid_proofs_verif = verify(tap_addr_valid_proofs);            //passes
+  init_havoc_verif = verify(InitialHavoc);                                //passes
+  
+  // shouldn't verify these since they are all inlined
+  //untrusted_measurement_verif = verify(MeasurementUntrustedOp);           
+  //enclave_measurement_verif = verify(MeasurementEnclaveOp);               
+  //enclave_comp_verif = verify(EnclaveComputation);                        
+  //integ_adv_step_verif = verify(IntegrityAdversarialStep);                
+  //integ_enc_step_verif = verify(IntegrityEnclaveStep);                    
+  //mem_obs_verif = verify(MemObserverComputation);                         
+  //cache_obs_verif = verify(CacheObserverComputation);                     
+  //pt_obs_verif = verify(PTObserverComputation);                           
+  //obs_step_verif = verify(ObserverStep);                                  
+  //enc_step_verif = verify(EnclaveStep);                                   
+
+
+  
+  check;
+  print_results;
+  //print_module;
+  //launch_verif.print_cex(excl_vaddr, excl_paddr, addr_map, status);
+}
+  
+  
+}
+
+
+
+
+
+
+
+      

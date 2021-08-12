@@ -243,7 +243,7 @@ control {
   set_solver_option(":relevancy", 0);
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
-  set_solver_option(":timeout", 240000);
+  set_solver_option(":timeout", 480000);
   verif_prove_integrity = verify(ProveIntegrity);
   check;
   print_results;
