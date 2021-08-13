@@ -12,36 +12,29 @@ integrity-proof-2:
 
 integrity-preservation-proof:
 	uclid --main integrity_preservation_proof $(PROOF_SOURCES) ./integrity-preservation-proof.ucl
-semantic-preservation-proof:
-	uclid --main semantic_preservation_proof $(PROOF_SOURCES) ./semantic-preservation-proof.ucl
-
-mem-conf-preservation-proof:
-	uclid --main mem_conf_preservation_proof $(PROOF_SOURCES) ./mem-conf-preservation-proof.ucl
-cache-conf-preservation-proof:
-	uclid --main cache_conf_preservation_proof $(PROOF_SOURCES) ./cache-conf-preservation-proof.ucl
-pt-conf-preservation-proof:
-	uclid --main pt_conf_preservation_proof $(PROOF_SOURCES) ./pt-conf-preservation-proof.ucl
 
 mem-conf-proof-1:
 	uclid --main mem_confidentiality_proof $(PROOF_SOURCES) ./mem-confidentiality-proof-1.ucl
 mem-conf-proof-2:
 	uclid --main mem_confidentiality_proof $(PROOF_SOURCES) ./mem-confidentiality-proof-2.ucl
-mem-conf-proof-3:
-	uclid --main mem_confidentiality_proof $(PROOF_SOURCES) ./mem-confidentiality-proof-3.ucl
+mem-conf-pres:
+	uclid --main mem_confidentiality_preservation_proof $(PROOF_SOURCES) ./mem-conf-preservation-proof.ucl
 
 cache-conf-proof-1:
 	uclid --main cache_confidentiality_proof $(PROOF_SOURCES) ./cache-confidentiality-proof-1.ucl
 cache-conf-proof-2:
 	uclid --main cache_confidentiality_proof $(PROOF_SOURCES) ./cache-confidentiality-proof-2.ucl
-cache-conf-proof-3:
-	uclid --main cache_confidentiality_proof $(PROOF_SOURCES) ./cache-confidentiality-proof-3.ucl
+cache-conf-pres:
+	uclid --main cache_confidentiality_preservation_proof $(PROOF_SOURCES) ./cache-conf-preservation-proof.ucl
+
 
 pt-conf-proof-1:
 	uclid --main pt_confidentiality_proof $(PROOF_SOURCES) ./pt-confidentiality-proof-1.ucl
 pt-conf-proof-2:
 	uclid --main pt_confidentiality_proof $(PROOF_SOURCES) ./pt-confidentiality-proof-2.ucl
-pt-conf-proof-3:
-	uclid --main pt_confidentiality_proof $(PROOF_SOURCES) ./pt-confidentiality-proof-3.ucl
+pt-conf-pres:
+	uclid --main pt_confidentiality_preservation_proof $(PROOF_SOURCES) ./pt-conf-preservation-proof.ucl
+
 
 
 

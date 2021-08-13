@@ -1,4 +1,4 @@
-module integrity_preservation_proof {
+module mem_confidentiality_preservation_proof {
 
 type * = proof_common.*;
 const * = proof_common.*;
@@ -6,10 +6,15 @@ function * = proof_common.*;
 define * = proof_common.*;
 
 instance cpu_1 : faas_tap();
+instance cpu_2 : faas_tap();
 
 
-procedure ProveIntegrityPreservation()
+procedure ProveMemConfPreservation(
+    /* cache    */  cache_conflict : boolean,
+    /* page tbl */  obs_pt_ev_read : boolean
+)
     modifies cpu_1;
+    modifies cpu_2;
 {
     var eid, p_eid, r_eid, r_parent_eid               : tap_enclave_id_t;
     var status, status_1, status_2                    : enclave_op_result_t;
@@ -30,37 +35,61 @@ procedure ProveIntegrityPreservation()
     var paddr_1, paddr_2                              : wap_addr_t;
     var data_1, data_2                                : word_t;
     var iter                                          : integer;
+    var load_addr_1, load_addr_2                     : vaddr_t;
+    var store_addr_1, store_addr_2                   : vaddr_t;
+    var store_data_1, store_data_2                   : word_t;
+    var r_addr_valid                                 : addr_valid_t;
+    var r_addr_map                                   : addr_map_t;
+    var r_excl_vaddr                                 : excl_vaddr_t;
+    var r_excl_map                                   : excl_map_t;
+    var r_bounds                                     : bounds_t;
+    var r_bmap                                       : excl_map_t;
+    var r_bmap_bounds                                : bounds_t;
+    var r_container_valid                            : container_valid_t;
+    var r_container_data                             : container_data_t;
+    var r_entrypoint                                 : vaddr_t;
+    var r_l_way, r_s_way                             : cache_way_index_t;
+    var r_pc                                         : vaddr_t;
+    var r_read                                       : regindex_t;
+    var r_write                                      : regindex_t;
+    var r_data                                       : word_t;
+    var r_pt_eid                                     : tap_enclave_id_t;
+    var r_pt_va                                      : vaddr_t;
+    var pt_eid                                       : tap_enclave_id_t;
+    var pt_vaddr                                     : vaddr_t;
+    var pt_valid                                     : addr_perm_t;
+    var pt_paddr                                     : wap_addr_t;
+    var l_vaddr                                      : vaddr_t;
+    var s_vaddr                                      : vaddr_t;
+    var s_data                                       : word_t;
+    var l_way, s_way                                 : cache_way_index_t;
+    var excp_1_1, excp_1_2, excp_2_1, excp_2_2       : exception_t;
+    var hit_1_1, hit_1_2, hit_2_1, hit_2_2           : boolean;
+    var p_eid_valid_1, p_eid_valid_2                 : boolean;
+    var observation, observation_1, observation_2    : word_t;
 
-    var old_cpu_enclave_id : tap_enclave_id_t;
-
-    // All enclave metadata, note that everything does not need to be equal for two enclaves to have the same semantic state.
-    var old_valid, new_valid : boolean;
-    var old_addr_map, new_addr_map: addr_map_t;
-    var old_addr_valid, new_addr_valid: addr_valid_t;
-    var old_addr_excl, new_addr_excl: excl_vaddr_t;
-    var old_num_threads, new_num_threads: count_t;
-    var old_entrypoint, new_entrypoint: vaddr_t;
-    var old_pc, new_pc: vaddr_t;
-    var old_regs, new_regs: regs_t;
-    var old_paused, new_paused: boolean;
-    var old_cache_conflict, new_cache_conflict: boolean;
-    var old_is_snapshot, new_is_snapshot: boolean;
-    var old_child_count, new_child_count: integer;
-    var old_parent, new_parent: tap_enclave_id_t;
-    var old_wap_addr_free, new_wap_addr_free: [wap_addr_t]boolean;
-    var old_region_bounds, new_region_bounds: bounds_t;
-    var old_bounds_valid, new_bounds_valid: boolean;
+    
 
 
-    // launch the same enclave in both traces.
-    call (current_mode_1) = cpu_1.InitialHavoc();
-    call cpu_1.InitOSMem(e_excl_map, e_container_data);
+    // initialize state of first cpu
+    call (current_mode) = cpu_1.InitialHavoc();
+    assert tap_addr_perm_x(cpu_1.cpu.cpu_addr_valid[cpu_1.cpu.cpu_pc]);
+    assert cpu_1.cpu.cpu_owner_map[cpu_1.cpu.cpu_addr_map[cpu_1.cpu.cpu_pc]] == cpu_1.cpu.cpu_enclave_id;
+    assert cpu_1.cpu.cpu_enclave_id == tap_null_enc_id;
+    // initialize the untrusted (OS) state with sane values.
+    call cpu_1.InitUntrustedState(cpu_1.cpu.cpu_addr_valid, cpu_1.cpu.cpu_addr_map, cpu_1.cpu.cpu_pc);
+    // launch should not leave the PC in an untenable sitation.
+    assume !e_excl_map[cpu_1.cpu.cpu_addr_map[cpu_1.cpu.cpu_pc]];
 
+    //assert(false);
     
 
     // Launch via a clone
     call (status_1) = cpu_1.launch(p_eid, e_addr_valid, e_addr_map, e_excl_vaddr, p_e_excl_map, p_e_bounds, e_entrypoint);
+    assume cpu_1.tap_enclave_metadata_cache_conflict[p_eid] == cache_conflict;
     assume status_1 == enclave_op_success;
+
+    //assert(false);
 
     //assert(false);
 
@@ -141,16 +170,14 @@ procedure ProveIntegrityPreservation()
         invariant current_mode != mode_enclave ==> cpu_1.tap_enclave_metadata_is_snapshot[p_eid] == true;
 
     {
-
-        havoc r_eid; havoc r_proof_op; havoc e_proof_op; havoc r_regs; havoc r_parent_eid; 
-        havoc iter;
-
-        assert (cpu_1.cpu.cpu_enclave_id == p_eid);
+        havoc e_proof_op;
         assume tap_proof_op_valid_in_enclave(e_proof_op);
-        assume e_proof_op != tap_proof_op_pause && e_proof_op != tap_proof_op_exit;
+        assume (e_proof_op != tap_proof_op_pause && e_proof_op != tap_proof_op_exit);
 
-        call (current_mode, vaddr_1, paddr_1, data_1) = cpu_1.IntegrityEnclaveStep(
-                                                        e_proof_op, iter);
+        // trace_1
+        call (current_mode, load_addr_1, l_way, store_addr_1, store_data_1, s_way) = 
+                            cpu_1.EnclaveStep(current_mode, p_eid, e_proof_op);
+
 
         //assert(false);
 
@@ -160,27 +187,11 @@ procedure ProveIntegrityPreservation()
 
     assert (cpu_1.tap_enclave_metadata_is_snapshot[p_eid] == true);
 
-    old_valid = cpu_1.tap_enclave_metadata_valid[p_eid];
-    old_addr_map = cpu_1.tap_enclave_metadata_addr_map[p_eid];
-    old_addr_valid = cpu_1.tap_enclave_metadata_addr_valid[p_eid];
-    old_addr_excl = cpu_1.tap_enclave_metadata_addr_excl[p_eid];
-    old_num_threads = cpu_1.tap_enclave_metadata_num_threads[p_eid];
-    old_entrypoint = cpu_1.tap_enclave_metadata_entrypoint[p_eid];
-    old_pc = cpu_1.tap_enclave_metadata_pc[p_eid];
-    old_regs = cpu_1.tap_enclave_metadata_regs[p_eid];
-    old_paused = cpu_1.tap_enclave_metadata_paused[p_eid];
-    old_cache_conflict = cpu_1.tap_enclave_metadata_cache_conflict[p_eid];
-    old_is_snapshot = cpu_1.tap_enclave_metadata_is_snapshot[p_eid];
-    old_child_count = cpu_1.tap_enclave_metadata_child_count[p_eid];
-    old_parent = cpu_1.tap_enclave_metadata_parent[p_eid];
-    old_wap_addr_free = cpu_1.tap_enclave_metadata_wap_addr_free[p_eid];
-    old_region_bounds = cpu_1.tap_enclave_metadata_region_bounds[p_eid];
-    old_bounds_valid = cpu_1.tap_enclave_metadata_bounds_valid[p_eid];
-
 
     assert current_mode == mode_untrusted;
     assert cpu_1.cpu.cpu_enclave_id == tap_null_enc_id;
     done = false;
+    //assert(false);
 
 
     while (!done) 
@@ -250,85 +261,146 @@ procedure ProveIntegrityPreservation()
                         (e_addr_map[va] == cpu_1.cpu.cpu_addr_map[va]));
         //invariant cpu_1.tap_enclave_metadata_addr_valid[p_eid] == old_addr_valid;
         //invariant cpu_1.tap_enclave_metadata_addr_map[p_eid] == old_addr_map;
-        invariant (forall (va : vaddr_t) ::
-                    cpu_1.tap_enclave_metadata_addr_excl[p_eid][va] ==>
-                    cpu_1.tap_enclave_metadata_addr_map[p_eid][va] == old_addr_map[va]);
-        invariant (forall (va : vaddr_t) ::
-                    cpu_1.tap_enclave_metadata_addr_excl[p_eid][va] ==>
-                    cpu_1.tap_enclave_metadata_addr_valid[p_eid][va] == old_addr_valid[va]);
-
+        
     {
-        havoc r_eid; havoc r_proof_op; havoc e_proof_op; havoc r_regs; havoc r_parent_eid; havoc done;
+        havoc done;
+        havoc r_proof_op;   havoc r_eid;    havoc r_pc;   havoc r_read;   havoc r_write;
+        havoc r_data;       havoc l_vaddr;  havoc s_vaddr;  havoc s_data;   havoc r_pt_eid;
+        havoc r_pt_va;      havoc pt_eid;   havoc pt_vaddr; havoc pt_valid; havoc  pt_paddr;
+        havoc  r_addr_valid; havoc r_addr_map; havoc r_excl_vaddr; havoc r_excl_map;
+        havoc r_bmap;     havoc r_container_valid; havoc r_container_data; havoc r_entrypoint;
+        havoc r_l_way;    havoc  r_s_way;
 
-        assume tap_proof_op_valid(r_proof_op);
+        // FAAS TAP
+        havoc r_parent_eid;
+        havoc r_bounds;
+        havoc r_bmap_bounds;
+
+        assume valid_regindex(r_read);
+        assume valid_regindex(r_write);
+        assume valid_cache_way_index(r_l_way);
+        assume valid_cache_way_index(r_s_way);
         assume (r_eid != p_eid || r_proof_op != tap_proof_op_destroy);
+
+        // trace_1
+        call (observation, current_mode, enclave_dead, status_1, excp_1_1, excp_1_2, hit_1_1, hit_1_2) =
+                                    cpu_1.ObserverStep(k_mem_observer_t, current_mode, p_eid, p_eid, p_eid_valid_1, r_eid, r_parent_eid, r_proof_op, 
+                                                r_pc, r_read, r_write, r_data, 
+                                                l_vaddr, s_vaddr, s_data,
+                                                r_pt_eid, r_pt_va,
+                                                pt_eid, pt_vaddr, pt_valid, pt_paddr,
+                                                r_addr_valid, r_addr_map, r_excl_vaddr,
+                                                r_excl_map, r_bounds, r_container_valid, r_container_data,
+                                                r_entrypoint, r_bmap, r_bmap_bounds,
+                                                r_l_way, r_s_way);
+
         
         
-        call (current_mode, enclave_dead) = cpu_1.IntegrityAdversarialStep(
-                mode_untrusted, p_eid, r_eid, r_parent_eid, r_regs, r_proof_op);
         assert enclave_dead == false;
         assert current_mode == mode_untrusted;
 
         //assert(false);
     }
 
+    //assert(false);
+
     if (cpu_1.cpu.cpu_enclave_id != tap_null_enc_id) {
         call (status) = cpu_1.pause();
         assert status == enclave_op_success;
     }
 
-    call (status_1) = cpu_1.clone(eid, p_eid, e_excl_map, e_bounds);
-    assume status_1 == enclave_op_success;
 
-    //assert(false);
+    call cpu_2.SetInitState(
+      cpu_1.cpu.cpu_mem,
+      cpu_1.cpu.cpu_regs,
+      cpu_1.cpu.cpu_pc,
+      cpu_1.cpu.cpu_enclave_id,
+      cpu_1.cpu.cpu_addr_valid,
+      cpu_1.cpu.cpu_addr_map,
+      cpu_1.cpu.cpu_owner_map,
+      cpu_1.cpu.cache.cache_valid_map,
+      cpu_1.cpu.cache.cache_tag_map,
+      cpu_1.untrusted_addr_valid,
+      cpu_1.untrusted_addr_map,
+      cpu_1.untrusted_regs,
+      cpu_1.untrusted_pc,
+      cpu_1.tap_enclave_metadata_valid,
+      cpu_1.tap_enclave_metadata_addr_map,
+      cpu_1.tap_enclave_metadata_addr_valid,
+      cpu_1.tap_enclave_metadata_addr_excl,
+      cpu_1.tap_enclave_metadata_entrypoint,
+      cpu_1.tap_enclave_metadata_pc,
+      cpu_1.tap_enclave_metadata_regs,
+      cpu_1.tap_enclave_metadata_paused,
+      cpu_1.tap_enclave_metadata_cache_conflict,
+      cpu_1.tap_enclave_metadata_is_snapshot,
+      cpu_1.tap_enclave_metadata_child_count,
+      cpu_1.tap_enclave_metadata_parent,
+      cpu_1.tap_enclave_metadata_wap_addr_free,
+      cpu_1.tap_enclave_metadata_postinit_measurement,
+      cpu_1.tap_enclave_metadata_region_bounds,
+      cpu_1.tap_enclave_metadata_bounds_valid
+    );
 
 
-    new_valid = cpu_1.tap_enclave_metadata_valid[eid];
-    new_addr_map = cpu_1.tap_enclave_metadata_addr_map[eid];
-    new_addr_valid = cpu_1.tap_enclave_metadata_addr_valid[eid];
-    new_addr_excl = cpu_1.tap_enclave_metadata_addr_excl[eid];
-    new_num_threads = cpu_1.tap_enclave_metadata_num_threads[eid];
-    new_entrypoint = cpu_1.tap_enclave_metadata_entrypoint[eid];
-    new_pc = cpu_1.tap_enclave_metadata_pc[eid];
-    new_regs = cpu_1.tap_enclave_metadata_regs[eid];
-    new_paused = cpu_1.tap_enclave_metadata_paused[eid];
-    new_cache_conflict = cpu_1.tap_enclave_metadata_cache_conflict[eid];
-    new_is_snapshot = cpu_1.tap_enclave_metadata_is_snapshot[eid];
-    new_child_count = cpu_1.tap_enclave_metadata_child_count[eid];
-    new_parent = cpu_1.tap_enclave_metadata_parent[eid];
-    new_wap_addr_free = cpu_1.tap_enclave_metadata_wap_addr_free[eid];
-    new_region_bounds = cpu_1.tap_enclave_metadata_region_bounds[eid];
-    new_bounds_valid = cpu_1.tap_enclave_metadata_bounds_valid[eid];
+    {
+        var l_word_1, l_word_2 : word_t;
+        var excp_1, excp_2 : exception_t;
+        var hit_2_1, hit_2_2: boolean;
+        var l_vaddr_1, l_vaddr_2: vaddr_t;
+        var l_way_1, l_way_2: cache_way_index_t;
+        var r_read_1, r_read_2: regindex_t;
+        var pc_1, pc_2: vaddr_t;
+        var word_1, word_2: word_t;
+        var paddr_1, paddr_2: wap_addr_t;
+        var eid_1, eid_2 : tap_enclave_id_t;
+
+        
+        havoc l_vaddr_1; havoc l_vaddr_2;
+        havoc l_way_1; havoc l_way_2;
+        havoc r_read_1; havoc r_read_2;
+        assume valid_cache_way_index(l_way_1);
+        assume valid_cache_way_index(l_way_2);
+        assume valid_regindex(r_read_1);
+        assume valid_regindex(r_read_2);
+
+        l_word_1 = k0_word_t;
+        l_word_2 = k0_word_t;
+        paddr_1 = cpu_1.cpu.cpu_addr_map[l_vaddr_1];
+        eid_1 = cpu_1.cpu.cpu_owner_map[paddr_1];
+        assume (e_excl_map[paddr_1] != true); // This assumption is necessary since the adversary knows that clone was invoked and trivially can find out which memory region is claimed. This is within the scope of our thread model/definition of confidentiality.
+
+
+        
+        call (status_1) = cpu_1.clone(eid, p_eid, e_excl_map, e_bounds);
+        assume status_1 == enclave_op_success;
+
+
+        call (l_word_1, excp_1, hit_2_1) = cpu_1.cpu_load_va(l_vaddr_1, l_way_1);
+        pc_1 = cpu_1.cpu.cpu_pc;
+        word_1 = cpu_1.cpu.cpu_regs[r_read_1];
+        observation_1 = uf_observation_mem(pc_1, l_word_1, word_1);
+
+
+
+
+        call (l_word_2, excp_2, hit_2_2) = cpu_2.cpu_load_va(l_vaddr_1, l_way_1);
+        pc_2 = cpu_2.cpu.cpu_pc;
+        word_2 = cpu_2.cpu.cpu_regs[r_read_1];
+        observation_2 = uf_observation_mem(pc_2, l_word_2, word_2);
+
+        assert (l_word_1 == l_word_2);
+        assert (pc_1 == pc_2);
+        assert (word_1 == word_2);
+        assert(observation_1 == observation_2);
+        //assert(false);
+    }
 
     
+
     //assert(false);
 
-    // Assertions equating enclave states
-    // This subset of enclave metadata defines the semantics of an enclave program
-    // In other words, if these are equal, then two physical enclaves will do the same thing
-    // given the same inputs and no out-of-memory faults.
-    assert (old_valid == new_valid);
-    assert (old_addr_excl == new_addr_excl);
-    assert (forall (va : vaddr_t) ::
-                    new_addr_excl[va] ==>
-                    new_addr_map[va] == old_addr_map[va]);
-    assert (forall (va : vaddr_t) ::
-                    new_addr_excl[va] ==>
-                    new_addr_valid[va] == old_addr_valid[va]);
 
-    assert (old_entrypoint == new_entrypoint);
-    assert (old_pc == new_pc);
-    assert (old_regs == new_regs);
-
-
-    // Note that these do not affect enclave integrity
-    assert (new_paused == false); 
-    assert (new_is_snapshot == false); 
-    assert (new_child_count == 0); 
-    assert (new_parent == p_eid);
-    assert (new_region_bounds == e_bounds);
-    assert (old_bounds_valid == new_bounds_valid);
-    //assert(false);
 }
 
 
@@ -340,8 +412,8 @@ control {
   set_solver_option(":relevancy", 0);
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
-  set_solver_option(":timeout", 15000);
-  verif_prove_integrity = verify(ProveIntegrityPreservation);
+  set_solver_option(":timeout", 30000);
+  verif_prove_integrity = verify(ProveMemConfPreservation);
   check;
   print_results;
 

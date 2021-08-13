@@ -295,7 +295,6 @@ procedure [inline] get_enclave_addr_map(eid : tap_enclave_id_t, va  : vaddr_t)
   }
 }
 
-//TODO: Would this affect the free list?
 procedure [inline] set_enclave_addr_map(
   eid    : tap_enclave_id_t,
   va     : vaddr_t,
@@ -3866,7 +3865,7 @@ procedure [inline] ObserverStep(
     } 
     (op == tap_proof_op_enter) : {
         call (status) = enter(r_eid);
-        assert (cpu.cpu_enclave_id == tap_null_enc_id && r_eid == eid) ==> 
+        assert (cpu.cpu_enclave_id == tap_null_enc_id && r_eid == eid && eid != p_eid) ==> 
                 (status == enclave_op_success);
         // switch to enclave mode.
         if (r_eid == eid && status == enclave_op_success) {
@@ -4107,6 +4106,29 @@ procedure [inline] SetInitState(
   call cpu.set_cpu_owner_map(_cpu_owner_map);
   call cpu.set_cpu_mem(_cpu_mem);
   call cpu.set_cache(_cache_valid_map, _cache_tag_map);
+}
+
+
+procedure  [inline] cpu_fetch_va(vaddr : vaddr_t, repl_way : cache_way_index_t) 
+    returns (data : word_t, excp : exception_t, hit : boolean)
+    modifies cpu;
+{
+    call (data, excp, hit) = cpu.fetch_va(vaddr, repl_way);
+}
+
+procedure [inline] cpu_load_va(vaddr : vaddr_t, repl_way : cache_way_index_t)
+    returns (data : word_t, excp : exception_t, hit : boolean)
+    modifies cpu;
+{
+    call (data, excp, hit) = cpu.load_va(vaddr, repl_way);
+}
+
+
+procedure [inline] cpu_store_va(vaddr : vaddr_t, data : word_t, repl_way : cache_way_index_t)
+    returns (excp : exception_t, hit : boolean)
+    modifies cpu;
+{
+    call (excp, hit) = cpu.store_va(vaddr, data, repl_way);
 }
 
 

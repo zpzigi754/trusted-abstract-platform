@@ -77,6 +77,14 @@ define tap_addr_perm_eq(p1 : addr_perm_t, p2 : addr_perm_t) : boolean
   tap_addr_perm_r(p1) == tap_addr_perm_r(p2) &&
   tap_addr_perm_w(p1) == tap_addr_perm_w(p2);
 
+// predicates
+define tap_addr_perm_rx_eq(p1 : addr_perm_t, p2 : addr_perm_t) : boolean
+= tap_addr_perm_x(p1) == tap_addr_perm_x(p2) &&
+  tap_addr_perm_r(p1) == tap_addr_perm_r(p2);
+
+
+
+
 
 //
 // enclave types
