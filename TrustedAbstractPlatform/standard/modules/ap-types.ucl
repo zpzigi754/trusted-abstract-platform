@@ -44,6 +44,9 @@ type excl_vaddr_t   = [vaddr_t]boolean;
 type addr_valid_t   = [vaddr_t]addr_perm_t;
 type addr_map_t     = [vaddr_t]wap_addr_t;
 
+type excl_laddr_t          = [linear_addr_t]boolean;
+type linear_addr_valid_t   = [linear_addr_t]addr_perm_t;
+
 
 
 define tap_addr_perm_p(p : addr_perm_t) : boolean = p[0:0] == 1bv1;
@@ -113,6 +116,8 @@ type shared_paddr_map_t                    = [wap_addr_t]boolean;
 type shared_vaddr_map_t                    = [vaddr_t]boolean;
 type paddr2paddr_map_t                     = [wap_addr_t]wap_addr_t;
 type owner_map_t                           = [wap_addr_t]tap_enclave_id_t;
+
+type linear_owner_map_t                       = [linear_addr_t]tap_enclave_id_t;
 
 // what is the measurement of this enclave?
 type tap_enclave_metadata_measurement_t    = [tap_enclave_id_t]measurement_t;

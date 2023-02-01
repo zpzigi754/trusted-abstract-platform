@@ -13,6 +13,7 @@ define * = ap_types.*;
 const block_os_ev_read  : boolean;
 
 instance cpu : abstract_cpu();
+instance see : see_cpu();
 
 
 
@@ -560,6 +561,13 @@ procedure [noinline] launch(
     tap_enclave_metadata_cache_conflict[eid]  = cache_conflict;
     status = enclave_op_success;
   }
+}
+
+procedure [noinline] simple_test()
+    ensures (see.enclave_id != old(see.enclave_id));
+    modifies see;
+{
+    call see.havoc_enclave_id();
 }
   
 //
@@ -1689,12 +1697,15 @@ procedure [inline] MeasurementUntrustedOp(
   modifies tap_enclave_metadata_paused;
   modifies tap_enclave_metadata_cache_conflict;
   modifies cpu;
+  modifies see;
 {
     assert (is_measurement_untrusted_op(op));
     status = enclave_op_success;
     if (op == tap_proof_op_enter) {
         call cpu.set_cpu_regs(regs);
         assert(cpu.cpu_enclave_id == tap_null_enc_id);
+        call simple_test();
+        assert false;
         call (status) = enter(eid);
         assert status == enclave_op_success;
         current_mode = mode_enclave;

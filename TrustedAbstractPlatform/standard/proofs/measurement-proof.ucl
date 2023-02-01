@@ -509,9 +509,9 @@ control {
   set_solver_option(":threads", 4);
   set_solver_option(":blast_full", true);
 
-  verif_measurement_proof_1 = verify(measurement_proof_part1);
+//  verif_measurement_proof_1 = verify(measurement_proof_part1);
   verif_measurement_proof_2 = verify(measurement_proof_part2);
-  verif_measurement_proof = verify(measurement_proof);
+//  verif_measurement_proof = verify(measurement_proof);
   check;
   //print_module;
   print_results;

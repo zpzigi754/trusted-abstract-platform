@@ -1,0 +1,26 @@
+module see_cpu {
+
+type * = ap_types.*;
+const * = ap_types.*;
+function * = ap_types.*;
+define * = ap_types.*;
+
+var enclave_id   : tap_enclave_id_t;
+var regs         : regs_t;
+var pc           : linear_addr_t;
+var addr_valid   : linear_addr_valid_t;
+var owner_map    : linear_owner_map_t;
+
+
+procedure [noinline] havoc_enclave_id()
+  ensures (enclave_id != old(enclave_id));
+  modifies enclave_id;
+{
+  var new_enclave_id : tap_enclave_id_t;
+  havoc new_enclave_id;
+  assume (new_enclave_id != enclave_id);
+  enclave_id = new_enclave_id;
+}
+
+
+}

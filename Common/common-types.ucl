@@ -13,6 +13,7 @@ type voffset_t = bv12;
 
 type wap_addr_t = bv22;
 type word_t  = bv32;
+type linear_addr_t = bv24;
 
 
 // -------------------------------------------------------------------- //
